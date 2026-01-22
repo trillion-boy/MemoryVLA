@@ -35,23 +35,28 @@ Flash Attention: ==2.5.5  ❌
 
 ---
 
-### **Step 1: Miniconda 설치 및 Python 3.10 환경 생성**
+### **Step 1: Miniforge 설치 및 Python 3.10 환경 생성**
 
 ```python
 %%bash
-# Miniconda 다운로드 및 설치
-wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
-bash /tmp/miniconda.sh -b -p /opt/conda
-rm /tmp/miniconda.sh
+# Miniforge 다운로드 및 설치 (conda-forge 전용, TOS 문제 없음)
+wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh
+bash /tmp/miniforge.sh -b -p /opt/conda
+rm /tmp/miniforge.sh
 
 # Conda 초기화
-/opt/conda/bin/conda init bash
+/opt/conda/bin/conda init bash > /dev/null 2>&1
 /opt/conda/bin/conda config --set auto_activate_base false
 
 # Python 3.10 환경 생성
 /opt/conda/bin/conda create -n memvla python=3.10 -y
 
 echo "✅ Python 3.10 환경 생성 완료"
+
+# 환경 확인
+source /opt/conda/etc/profile.d/conda.sh
+conda activate memvla
+python --version
 ```
 
 **예상 시간**: 2-3분

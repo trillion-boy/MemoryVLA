@@ -41,6 +41,7 @@ This is MemoryVLA based on OpenVLA codebase, **if you need use dexbotic codebase
 
  * [**Model Zoo & Benchmark Results**](#Model-Zoo-&-Benchmark-Results)
  * [**Install**](#Install)
+ * [**🚀 Google Colab Quick Start**](#google-colab-quick-start) ⭐ **New!**
  * [**Training**](#Training)
  * [**Evaluation in SimplerEnv**](#Evaluation-in-SimplerEnv)
  * [**Evaluation in LIBERO**](#Evaluation-in-LIBERO)
@@ -122,6 +123,42 @@ If you are using an NVIDIA Hopper GPU (e.g., H20) and encounter the error
 # Fix for NVIDIA H20: "Floating point exception (core dumped)"
 pip install nvidia-cublas-cu12==12.4.5.8
 ```
+
+## 🚀 Google Colab Quick Start
+
+Want to try MemoryVLA without local setup? Use **Google Colab** with free T4 GPU (15GB VRAM)!
+
+**📋 Complete Guide**: [COLAB_QUICK_START.md](COLAB_QUICK_START.md)
+
+### Quick Summary (5 Steps, ~30-50 min setup)
+
+**Step 1**: Install Miniforge (TOS-free)
+```bash
+%%bash
+wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh
+bash /tmp/miniforge.sh -b -p /opt/conda
+/opt/conda/bin/conda init bash
+/opt/conda/bin/conda create -n memvla python=3.10 -y
+```
+
+**Step 2-4**: Install PyTorch 2.2.0, TensorFlow 2.15.0, Flash Attention, MemoryVLA, LIBERO
+
+**Step 5**: Download checkpoint & run evaluation
+```bash
+# Download LIBERO Spatial checkpoint (~14GB)
+python -c "from huggingface_hub import snapshot_download; snapshot_download('shihao1895/memvla-libero-spatial', cache_dir='/content/checkpoints')"
+
+# Run quick test (1 task, 1 trial, ~5 min)
+python evaluation/libero/eval_libero_colab.py \
+    --checkpoint_path /content/checkpoints/... \
+    --task_suite_name libero_spatial \
+    --num_trials_per_task 1 \
+    --use_bf16
+```
+
+**📊 Expected Results**: ~98% success rate on LIBERO Spatial
+
+See [COLAB_QUICK_START.md](COLAB_QUICK_START.md) for complete step-by-step instructions!
 
 ## Training
 

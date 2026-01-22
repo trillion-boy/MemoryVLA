@@ -44,19 +44,19 @@ print("="*80)
 
 
 # ============================================================================
-# 셀 2: Miniconda 설치
+# 셀 2: Miniforge 설치 (TOS 문제 없음)
 # ============================================================================
 print("\n" + "="*80)
-print("📦 Miniconda 설치")
+print("📦 Miniforge 설치 (conda-forge 전용)")
 print("="*80)
 
 import os
 import sys
 
-# Miniconda 다운로드 및 설치
-!wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
-!bash /tmp/miniconda.sh -b -p /opt/conda
-!rm /tmp/miniconda.sh
+# Miniforge 다운로드 및 설치
+!wget -q https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh -O /tmp/miniforge.sh
+!bash /tmp/miniforge.sh -b -p /opt/conda
+!rm /tmp/miniforge.sh
 
 # PATH 업데이트
 os.environ["PATH"] = f"/opt/conda/bin:{os.environ['PATH']}"
@@ -65,7 +65,7 @@ os.environ["PATH"] = f"/opt/conda/bin:{os.environ['PATH']}"
 !conda init bash > /dev/null 2>&1
 !conda config --set auto_activate_base false
 
-print("✅ Miniconda 설치 완료")
+print("✅ Miniforge 설치 완료")
 !conda --version
 
 
@@ -77,7 +77,7 @@ print("🐍 Python 3.10 환경 생성")
 print("="*80)
 
 # Python 3.10 환경 생성
-!conda create -n memvla python=3.10 -y -q
+!conda create -n memvla python=3.10 -y
 
 print("✅ Python 3.10 환경 생성 완료")
 

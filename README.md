@@ -141,7 +141,7 @@ bash /tmp/miniforge.sh -b -p /opt/conda
 /opt/conda/bin/conda create -n memvla python=3.10 -y
 ```
 
-**Step 2-4**: Install PyTorch 2.2.0, TensorFlow 2.15.0, Flash Attention, MemoryVLA, LIBERO
+**Step 2-4**: Install PyTorch 2.2.0, TensorFlow 2.15.0, MemoryVLA, LIBERO (Flash Attention 제외 - inference에서 불필요)
 
 **Step 5**: Download checkpoint & run evaluation
 ```bash

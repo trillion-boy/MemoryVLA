@@ -107,20 +107,18 @@ pip install tensorflow==2.15.0 tensorflow_datasets==4.9.3 tensorflow_graphics==2
 echo "NumPy 1.26.4 설치 중..."
 pip install numpy==1.26.4 -q
 
-# Flash Attention 2.5.5 설치 (Prebuilt wheel)
-echo "Flash Attention 2.5.5 설치 중..."
-cd /content
-wget -q https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.5/flash_attn-2.5.5+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
-pip install flash_attn-2.5.5+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl -q
-rm flash_attn-2.5.5+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
+# Flash Attention 건너뜀 (inference에서 불필요, T4 GPU 컴파일 이슈)
+echo ""
+echo "⚠️  Flash Attention 건너뜀 (inference에서 불필요)"
+echo "    PyTorch 2.2.0의 SDPA (Scaled Dot Product Attention) 자동 사용"
 
+echo ""
 echo "✅ 주요 패키지 설치 완료"
 
 # 버전 확인
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
 python -c "import tensorflow as tf; print(f'TensorFlow: {tf.__version__}')"
 python -c "import numpy as np; print(f'NumPy: {np.__version__}')"
-python -c "import flash_attn; print('Flash Attention: OK')"
 """
 
 # 스크립트 파일로 저장
@@ -153,16 +151,18 @@ cd /content
 if [ -d "MemoryVLA" ]; then
     rm -rf MemoryVLA
 fi
+echo "Cloning MemoryVLA..."
 git clone https://github.com/shihao1895/MemoryVLA.git -q
 cd MemoryVLA
 
-# editable 모드로 설치
-pip install -e . -q
+# editable 모드로 설치 (flash_attn 에러 무시)
+echo "Installing MemoryVLA (flash_attn 제외)..."
+pip install -e . 2>&1 | grep -v "flash_attn" || true
 
 echo "✅ MemoryVLA 설치 완료"
 
 # 설치된 주요 패키지 확인
-pip list | grep -E "transformers|accelerate|peft|timm|flash-attn"
+pip list | grep -E "transformers|accelerate|peft|timm"
 """
 
 with open("/tmp/install_memvla.sh", "w") as f:

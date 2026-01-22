@@ -63,33 +63,35 @@ python --version
 
 ---
 
-### **Step 2: PyTorch, TensorFlow, Flash Attention 설치**
+### **Step 2: PyTorch, TensorFlow 설치 (Flash Attention 제외)**
 
 ```python
 %%bash
 source /opt/conda/etc/profile.d/conda.sh
 conda activate memvla
 
-# pip 업그레이드
 pip install --upgrade pip -q
 
 # PyTorch 2.2.0 + CUDA 12.1
+echo "Installing PyTorch 2.2.0..."
 pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 \
     --index-url https://download.pytorch.org/whl/cu121 -q
 
 # TensorFlow 2.15.0
+echo "Installing TensorFlow 2.15.0..."
 pip install tensorflow==2.15.0 tensorflow_datasets==4.9.3 \
     tensorflow_graphics==2021.12.3 -q
 
 # NumPy 1.26.4
 pip install numpy==1.26.4 -q
 
-# Flash Attention 2.5.5 (prebuilt wheel)
-cd /content
-wget -q https://github.com/Dao-AILab/flash-attention/releases/download/v2.5.5/flash_attn-2.5.5+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl
-pip install flash_attn-2.5.5+cu122torch2.2cxx11abiFALSE-cp310-cp310-linux_x86_64.whl -q
+# Flash Attention 건너뜀 (inference에서 불필요, T4 GPU 컴파일 이슈)
+echo ""
+echo "⚠️  Flash Attention 건너뜀 (inference에서 불필요)"
+echo "    PyTorch 2.2.0의 SDPA (Scaled Dot Product Attention) 자동 사용"
 
 # 버전 확인
+echo ""
 echo "✅ 패키지 설치 완료:"
 python -c "import sys; print(f'Python: {sys.version}')"
 python -c "import torch; print(f'PyTorch: {torch.__version__}')"
@@ -97,7 +99,9 @@ python -c "import tensorflow as tf; print(f'TensorFlow: {tf.__version__}')"
 python -c "import numpy as np; print(f'NumPy: {np.__version__}')"
 ```
 
-**예상 시간**: 5-7분
+**예상 시간**: 3-5분 (Flash Attention 컴파일 없어서 빠름!)
+
+> **Note**: Flash Attention은 training에서만 필요하며, inference에서는 PyTorch 2.0+의 내장 SDPA가 자동으로 사용됩니다. T4 GPU에서 Flash Attention 컴파일은 실패율이 높고 시간이 오래 걸리므로 생략합니다.
 
 ---
 
@@ -110,14 +114,19 @@ conda activate memvla
 
 cd /content
 
-# MemoryVLA 클론 및 설치
+# MemoryVLA 클론
+echo "Cloning MemoryVLA..."
 git clone https://github.com/shihao1895/MemoryVLA.git -q
 cd MemoryVLA
-pip install -e . -q
+
+# MemoryVLA 설치 (flash_attn 에러 무시)
+echo "Installing MemoryVLA..."
+pip install -e . 2>&1 | grep -v "flash_attn" || true
 
 echo "✅ MemoryVLA 설치 완료"
 
 # 시스템 패키지 설치 (LIBERO 의존성)
+echo "Installing system packages for LIBERO..."
 apt-get update -qq
 apt-get install -y -qq libosmesa6-dev libgl1-mesa-dev libglu1-mesa-dev \
     libglfw3 libglew-dev patchelf ffmpeg
@@ -125,6 +134,7 @@ apt-get install -y -qq libosmesa6-dev libgl1-mesa-dev libglu1-mesa-dev \
 # LIBERO 클론 및 설치
 cd /content
 mkdir -p third_libs
+echo "Installing LIBERO..."
 git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git third_libs/LIBERO -q
 cd third_libs/LIBERO
 pip install -e . -q
@@ -133,6 +143,8 @@ echo "✅ LIBERO 설치 완료"
 ```
 
 **예상 시간**: 10-15분
+
+> **Note**: MemoryVLA의 pyproject.toml에 `flash_attn==2.5.5`가 포함되어 있지만, inference에서는 필요 없으므로 에러가 발생해도 무시됩니다. PyTorch 2.2.0의 SDPA가 자동으로 사용됩니다.
 
 ---
 

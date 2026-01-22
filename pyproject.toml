@@ -10,7 +10,7 @@ authors = [
 description = "MemoryVLA: Perceptual-Cognitive Memory in Vision-Language-Action Models for Robotic Manipulation"
 version = "0.0.1"
 readme = "README.md"
-requires-python = "==3.10"
+requires-python = ">=3.10,<3.11"
 keywords = ["vision-language-actions models", " robotic manipulation", "memory"]
 license = {file = "LICENSE"}
 classifiers = [
@@ -31,7 +31,7 @@ dependencies = [
     "torch==2.2.0",
     "torchvision==0.17.0",
     "torchaudio==2.2.0",
-    "flash_attn==2.5.5",
+    # "flash_attn==2.5.5",  # Moved to optional-dependencies (training only, not required for inference)
     "accelerate>=0.25.0",
     "draccus>=0.8.0",
     "einops",
@@ -77,6 +77,9 @@ dev = [
     "ipython",
     "pre-commit",
     "ruff>=0.2.2",
+]
+training = [
+    "flash_attn==2.5.5",  # Required for training only (not needed for inference, use SDPA instead)
 ]
 sagemaker = [
     "boto3",

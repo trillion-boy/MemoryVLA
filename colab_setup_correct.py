@@ -147,19 +147,29 @@ conda activate memvla
 
 cd /content
 
-# MemoryVLA 클론
+# MemoryVLA 클론 (수정된 버전)
 if [ -d "MemoryVLA" ]; then
     rm -rf MemoryVLA
 fi
-echo "Cloning MemoryVLA..."
-git clone https://github.com/shihao1895/MemoryVLA.git -q
+echo "Cloning MemoryVLA (Python 3.10.x 지원 버전)..."
+git clone -b claude/colab-memoryvla-simulation-ieGpy https://github.com/trillion-boy/MemoryVLA.git -q
 cd MemoryVLA
 
-# editable 모드로 설치 (flash_attn 에러 무시)
-echo "Installing MemoryVLA (flash_attn 제외)..."
-pip install -e . 2>&1 | grep -v "flash_attn" || true
+# editable 모드로 설치
+echo "Installing MemoryVLA..."
+pip install -e . -q
 
 echo "✅ MemoryVLA 설치 완료"
+
+# 설치 확인
+python -c "
+try:
+    from vla import load_vla
+    print('✅ VLA 모듈 import 성공')
+except Exception as e:
+    print(f'❌ VLA 모듈 import 실패: {e}')
+    exit(1)
+"
 
 # 설치된 주요 패키지 확인
 pip list | grep -E "transformers|accelerate|peft|timm"

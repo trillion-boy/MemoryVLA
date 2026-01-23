@@ -77,7 +77,11 @@ class DirectMemVLAPolicy:
         # Action chunking
         actions = []
         for i in range(min(self.action_chunking_window, len(unnormed_actions))):
-            actions.append(unnormed_actions[i].cpu().numpy())
+            action = unnormed_actions[i]
+            # Handle both torch tensors and numpy arrays
+            if torch.is_tensor(action):
+                action = action.cpu().numpy()
+            actions.append(action)
 
         return actions
 

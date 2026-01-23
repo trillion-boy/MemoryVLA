@@ -138,9 +138,9 @@ except Exception as e:
 # 시스템 패키지 설치 (LIBERO 의존성)
 echo ""
 echo "Installing system packages for LIBERO..."
-apt-get update -qq
+apt-get update -qq 2>&1 | grep -v "Skipping acquire"
 apt-get install -y -qq libosmesa6-dev libgl1-mesa-dev libglu1-mesa-dev \
-    libglfw3 libglew-dev patchelf ffmpeg
+    libglfw3 libglew-dev patchelf ffmpeg 2>&1 | grep -v "Skipping acquire"
 
 # LIBERO 클론 및 설치
 cd /content
@@ -151,6 +151,19 @@ cd third_libs/LIBERO
 pip install -e . -q
 
 echo "✅ LIBERO 설치 완료"
+
+# LIBERO 설치 확인
+python << 'LIBERO_CHECK'
+try:
+    from libero.libero import benchmark
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suites = list(benchmark_dict.keys())
+    print(f"✅ LIBERO import 성공")
+    print(f"✅ Task suites: {task_suites}")
+except Exception as e:
+    print(f"❌ LIBERO import 실패: {e}")
+    exit(1)
+LIBERO_CHECK
 ```
 
 **예상 시간**: 5-10분

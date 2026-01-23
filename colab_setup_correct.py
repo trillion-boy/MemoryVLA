@@ -221,14 +221,25 @@ cd third_libs/LIBERO
 pip install -e . -q
 
 echo "✅ LIBERO 설치 완료"
+
+# LIBERO 설치 확인
+python << 'LIBERO_CHECK'
+try:
+    from libero.libero import benchmark
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suites = list(benchmark_dict.keys())
+    print(f"✅ LIBERO import 성공")
+    print(f"✅ Task suites: {task_suites}")
+except Exception as e:
+    print(f"❌ LIBERO import 실패: {e}")
+    exit(1)
+LIBERO_CHECK
 """
 
 with open("/tmp/install_libero.sh", "w") as f:
     f.write(libero_install_script)
 
 !bash /tmp/install_libero.sh
-
-print("✅ LIBERO 설치 완료")
 
 
 # ============================================================================

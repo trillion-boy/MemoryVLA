@@ -128,9 +128,28 @@ pip install nvidia-cublas-cu12==12.4.5.8
 
 Want to try MemoryVLA without local setup? Use **Google Colab** with free T4 GPU (15GB VRAM)!
 
+### 두 가지 방법:
+
+#### 방법 1: conda 없이 (추천 - interactive input 가능) ⭐ **New!**
+
+**📋 Complete Guide**: [COLAB_NO_CONDA.md](COLAB_NO_CONDA.md)
+
+- ✅ conda 설치 없이 간단
+- ✅ interactive input 가능 (LIBERO 데이터셋 경로 직접 입력)
+- ✅ 빠른 설치 (~15-20분)
+- ⚠️ Python 3.12에서 실행 (호환성 문제 가능)
+
+#### 방법 2: conda 가상환경 (안정적)
+
 **📋 Complete Guide**: [COLAB_QUICK_START.md](COLAB_QUICK_START.md)
 
-### Quick Summary (5 Steps, ~30-50 min setup)
+### Quick Summary - 방법 1 (6 Steps, ~15-20 min setup)
+
+**Step 1-2**: PyTorch 2.2.0, TensorFlow 2.15.0 다운그레이드
+**Step 3-5**: MemoryVLA, LIBERO 설치
+**Step 6**: LIBERO 검증 (interactive input 가능!)
+
+### Quick Summary - 방법 2 (5 Steps, ~30-50 min setup)
 
 **Step 1**: Install Miniforge (TOS-free)
 ```bash

@@ -93,19 +93,19 @@ echo "현재 Python 버전:"
 python --version
 
 # pip 업그레이드
-pip install --upgrade pip -q
+pip install --upgrade pip
 
 # PyTorch 2.2.0 + CUDA 12.1 설치
 echo "PyTorch 2.2.0 설치 중..."
-pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121 -q
+pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 --index-url https://download.pytorch.org/whl/cu121
 
 # TensorFlow 2.15.0 설치
 echo "TensorFlow 2.15.0 설치 중..."
-pip install tensorflow==2.15.0 tensorflow_datasets==4.9.3 tensorflow_graphics==2021.12.3 -q
+pip install tensorflow==2.15.0 tensorflow_datasets==4.9.3 tensorflow_graphics==2021.12.3
 
 # NumPy 1.26.4 설치
 echo "NumPy 1.26.4 설치 중..."
-pip install numpy==1.26.4 -q
+pip install numpy==1.26.4
 
 # Flash Attention 건너뜀 (inference에서 불필요, T4 GPU 컴파일 이슈)
 echo ""
@@ -152,12 +152,12 @@ if [ -d "MemoryVLA" ]; then
     rm -rf MemoryVLA
 fi
 echo "Cloning MemoryVLA (Python 3.10.x 지원 버전)..."
-git clone -b claude/colab-memoryvla-simulation-ieGpy https://github.com/trillion-boy/MemoryVLA.git -q
+git clone -b claude/colab-memoryvla-simulation-ieGpy https://github.com/trillion-boy/MemoryVLA.git
 cd MemoryVLA
 
 # editable 모드로 설치
 echo "Installing MemoryVLA..."
-pip install -e . -q
+pip install -e .
 
 echo "✅ MemoryVLA 설치 완료"
 
@@ -190,8 +190,8 @@ print("="*80)
 
 # 시스템 패키지 설치
 print("시스템 패키지 설치 중...")
-!apt-get update -qq
-!apt-get install -y -qq \
+!apt-get update
+!apt-get install -y \
     libosmesa6-dev \
     libgl1-mesa-dev \
     libglu1-mesa-dev \
@@ -214,31 +214,25 @@ mkdir -p third_libs
 if [ -d "third_libs/LIBERO" ]; then
     rm -rf third_libs/LIBERO
 fi
-git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git third_libs/LIBERO -q
+git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git third_libs/LIBERO
 cd third_libs/LIBERO
 
 # LIBERO 설치
-pip install -e . -q
+pip install -e .
 
 echo "✅ LIBERO 설치 완료"
 
-# LIBERO 설치 확인 (환경 변수로 자동 응답)
-export LIBERO_DATASETS=/content/libero_datasets
-mkdir -p /content/libero_datasets
+# LIBERO 설치 확인 (경로 질문에 직접 대답)
+echo ""
+echo "LIBERO가 데이터셋 경로를 물어봅니다."
+echo "N을 입력하면 기본 경로를 사용합니다."
 
 python << 'LIBERO_CHECK'
-import os
-os.environ['LIBERO_DATASETS'] = '/content/libero_datasets'
-
-try:
-    from libero.libero import benchmark
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suites = list(benchmark_dict.keys())
-    print(f"✅ LIBERO import 성공")
-    print(f"✅ Task suites: {task_suites}")
-except Exception as e:
-    print(f"❌ LIBERO import 실패: {e}")
-    exit(1)
+from libero.libero import benchmark
+benchmark_dict = benchmark.get_benchmark_dict()
+task_suites = list(benchmark_dict.keys())
+print(f"✅ LIBERO import 성공")
+print(f"✅ Task suites: {task_suites}")
 LIBERO_CHECK
 """
 

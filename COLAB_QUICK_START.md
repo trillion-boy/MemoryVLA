@@ -161,39 +161,43 @@ echo "✅ LIBERO 설치 완료"
 
 **예상 시간**: 5-10분
 
-> **중요**: 다음 셀에서 LIBERO를 검증합니다. sys.path로 conda 환경에 접근하여 interactive input이 가능합니다!
+> **중요**: 다음 셀에서 LIBERO를 검증합니다. config.yaml을 미리 생성하고 PYTHONPATH로 경로를 지정합니다.
 
 ---
 
-### **Step 3-B: LIBERO 설치 확인 (별도 셀 - interactive input 가능!)**
+### **Step 3-B: LIBERO 설치 확인 (별도 셀)**
 
-```python
-import sys
+```bash
+%%bash
+# LIBERO config 미리 생성 (interactive input 불필요)
+mkdir -p /root/.libero
+cat > /root/.libero/config.yaml << 'EOF'
+benchmark_root: /content/third_libs/LIBERO/libero/libero
+bddl_files: /content/third_libs/LIBERO/libero/libero/bddl_files
+init_states: /content/third_libs/LIBERO/libero/libero/init_files
+datasets: /content/third_libs/LIBERO/libero/datasets
+assets: /content/third_libs/LIBERO/libero/libero/assets
+EOF
 
-# conda 환경의 site-packages 추가
-sys.path.insert(0, '/opt/conda/envs/memvla/lib/python3.10/site-packages')
+# PYTHONPATH 명시적으로 설정하고 conda Python 직접 실행
+export PYTHONPATH=/content/third_libs/LIBERO:$PYTHONPATH
 
-# LIBERO 소스 디렉토리 직접 추가 (editable 설치)
-sys.path.insert(0, '/content/third_libs/LIBERO')
-
-# 이제 interactive input 가능!
+/opt/conda/envs/memvla/bin/python -c "
 from libero.libero import benchmark
-
 benchmark_dict = benchmark.get_benchmark_dict()
 task_suites = list(benchmark_dict.keys())
-
 print('✅ LIBERO import 성공')
 print(f'✅ Task suites: {task_suites}')
+"
 ```
-
-**데이터셋 경로를 물어보면 `N` 입력하세요!**
 
 **예상 출력**:
 ```
-Do you want to specify a custom path for the dataset folder? (Y/N): N
 ✅ LIBERO import 성공
-✅ Task suites: ['libero_spatial', 'libero_object', 'libero_goal', 'libero_10', 'libero_90']
+✅ Task suites: ['libero_spatial', 'libero_object', 'libero_goal', 'libero_90', 'libero_10', 'libero_100']
 ```
+
+> **Note**: config.yaml을 미리 생성하여 interactive input을 우회하고, PYTHONPATH로 LIBERO 경로를 명시합니다.
 
 > **Note**: Flash Attention이 dependencies에서 제거되었습니다 (optional-dependencies[training]로 이동). Inference에서는 PyTorch 2.2.0의 내장 SDPA가 자동으로 사용됩니다.
 

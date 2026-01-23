@@ -222,18 +222,27 @@ pip install -e .
 
 echo "✅ LIBERO 설치 완료"
 
+# LIBERO config 미리 생성
+mkdir -p /root/.libero
+cat > /root/.libero/config.yaml << 'CONFIG_EOF'
+benchmark_root: /content/third_libs/LIBERO/libero/libero
+bddl_files: /content/third_libs/LIBERO/libero/libero/bddl_files
+init_states: /content/third_libs/LIBERO/libero/libero/init_files
+datasets: /content/third_libs/LIBERO/libero/datasets
+assets: /content/third_libs/LIBERO/libero/libero/assets
+CONFIG_EOF
+
 # LIBERO 설치 확인
 echo ""
-echo "✅ LIBERO 설치 완료"
-echo ""
-echo "⚠️  LIBERO 검증은 별도 Python 셀에서 수행하세요 (interactive input 지원):"
-echo ""
-echo "import sys"
-echo "sys.path.insert(0, '/opt/conda/envs/memvla/lib/python3.10/site-packages')"
-echo "from libero.libero import benchmark"
-echo "benchmark_dict = benchmark.get_benchmark_dict()"
-echo "task_suites = list(benchmark_dict.keys())"
-echo "print(f'Task suites: {task_suites}')"
+echo "LIBERO 검증 중..."
+export PYTHONPATH=/content/third_libs/LIBERO:$PYTHONPATH
+/opt/conda/envs/memvla/bin/python -c "
+from libero.libero import benchmark
+benchmark_dict = benchmark.get_benchmark_dict()
+task_suites = list(benchmark_dict.keys())
+print('✅ LIBERO import 성공')
+print(f'✅ Task suites: {task_suites}')
+"
 """
 
 with open("/tmp/install_libero.sh", "w") as f:

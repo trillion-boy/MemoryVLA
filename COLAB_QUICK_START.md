@@ -152,21 +152,35 @@ pip install -e .
 
 echo "✅ LIBERO 설치 완료"
 
-# LIBERO 설치 확인 (경로 질문에 직접 대답)
-echo ""
-echo "LIBERO가 데이터셋 경로를 물어봅니다."
-echo "N을 입력하면 기본 경로를 사용합니다."
-
-python -c "
-from libero.libero import benchmark
-benchmark_dict = benchmark.get_benchmark_dict()
-task_suites = list(benchmark_dict.keys())
-print(f'✅ LIBERO import 성공')
-print(f'✅ Task suites: {task_suites}')
-"
+echo "✅ LIBERO 설치 완료"
 ```
 
 **예상 시간**: 5-10분
+
+> **중요**: 다음 셀에서 LIBERO를 검증합니다. 데이터셋 경로를 물어보면 **N**을 입력하세요.
+
+---
+
+### **Step 3-B: LIBERO 설치 확인 (별도 셀)**
+
+```python
+from libero.libero import benchmark
+
+benchmark_dict = benchmark.get_benchmark_dict()
+task_suites = list(benchmark_dict.keys())
+
+print(f'✅ LIBERO import 성공')
+print(f'✅ Task suites: {task_suites}')
+```
+
+**데이터셋 경로 질문이 나오면 `N` 입력**
+
+**예상 출력**:
+```
+Do you want to specify a custom path for the dataset folder? (Y/N): N
+✅ LIBERO import 성공
+✅ Task suites: ['libero_spatial', 'libero_object', 'libero_goal', 'libero_10', 'libero_90']
+```
 
 > **Note**: Flash Attention이 dependencies에서 제거되었습니다 (optional-dependencies[training]로 이동). Inference에서는 PyTorch 2.2.0의 내장 SDPA가 자동으로 사용됩니다.
 

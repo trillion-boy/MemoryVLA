@@ -152,8 +152,14 @@ pip install -e . -q
 
 echo "✅ LIBERO 설치 완료"
 
-# LIBERO 설치 확인
+# LIBERO 설치 확인 (환경 변수로 자동 응답)
+export LIBERO_DATASETS=/content/libero_datasets
+mkdir -p /content/libero_datasets
+
 python << 'LIBERO_CHECK'
+import os
+os.environ['LIBERO_DATASETS'] = '/content/libero_datasets'
+
 try:
     from libero.libero import benchmark
     benchmark_dict = benchmark.get_benchmark_dict()
@@ -214,6 +220,7 @@ conda activate memvla
 export MUJOCO_GL=osmesa
 export PYOPENGL_PLATFORM=osmesa
 export TOKENIZERS_PARALLELISM=false
+export LIBERO_DATASETS=/content/libero_datasets
 
 cd /content/MemoryVLA
 

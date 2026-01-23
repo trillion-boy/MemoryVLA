@@ -170,8 +170,11 @@ echo "✅ LIBERO 설치 완료"
 ```python
 import sys
 
-# conda 환경의 site-packages를 Python path에 추가
+# conda 환경의 site-packages 추가
 sys.path.insert(0, '/opt/conda/envs/memvla/lib/python3.10/site-packages')
+
+# LIBERO 소스 디렉토리 직접 추가 (editable 설치)
+sys.path.insert(0, '/content/third_libs/LIBERO')
 
 # 이제 interactive input 가능!
 from libero.libero import benchmark

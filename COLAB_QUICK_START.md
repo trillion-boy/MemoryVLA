@@ -116,6 +116,9 @@ cd /content
 
 # MemoryVLA 클론 (수정된 버전 - Python 3.10.x 지원)
 echo "Cloning MemoryVLA..."
+if [ -d "MemoryVLA" ]; then
+    rm -rf MemoryVLA
+fi
 git clone -b claude/colab-memoryvla-simulation-ieGpy https://github.com/trillion-boy/MemoryVLA.git
 cd MemoryVLA
 
@@ -146,38 +149,46 @@ apt-get install -y libosmesa6-dev libgl1-mesa-dev libglu1-mesa-dev \
 cd /content
 mkdir -p third_libs
 echo "Installing LIBERO..."
+if [ -d "third_libs/LIBERO" ]; then
+    rm -rf third_libs/LIBERO
+fi
 git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git third_libs/LIBERO
 cd third_libs/LIBERO
 pip install -e .
-
-echo "✅ LIBERO 설치 완료"
 
 echo "✅ LIBERO 설치 완료"
 ```
 
 **예상 시간**: 5-10분
 
-> **중요**: 다음 셀에서 LIBERO를 검증합니다. 데이터셋 경로를 물어보면 **N**을 입력하세요.
+> **중요**: 다음 셀에서 LIBERO를 검증합니다. conda 환경에서 실행되어야 합니다.
 
 ---
 
 ### **Step 3-B: LIBERO 설치 확인 (별도 셀)**
 
 ```python
+%%bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate memvla
+
+# LIBERO 데이터셋 기본 경로 설정 (자동으로 'N' 선택)
+export LIBERO_DATASETS=/content/libero_datasets
+
+python -c "
 from libero.libero import benchmark
 
 benchmark_dict = benchmark.get_benchmark_dict()
 task_suites = list(benchmark_dict.keys())
 
-print(f'✅ LIBERO import 성공')
+print('✅ LIBERO import 성공')
 print(f'✅ Task suites: {task_suites}')
+"
 ```
-
-**데이터셋 경로 질문이 나오면 `N` 입력**
 
 **예상 출력**:
 ```
-Do you want to specify a custom path for the dataset folder? (Y/N): N
+Do you want to specify a custom path for the dataset folder? (Y/N): [자동으로 기본 경로 사용]
 ✅ LIBERO import 성공
 ✅ Task suites: ['libero_spatial', 'libero_object', 'libero_goal', 'libero_10', 'libero_90']
 ```

@@ -222,10 +222,12 @@ pip install -e .
 
 echo "✅ LIBERO 설치 완료"
 
-# LIBERO 설치 확인 (경로 질문에 직접 대답)
+# LIBERO 설치 확인 (자동으로 기본 경로 사용)
 echo ""
-echo "LIBERO가 데이터셋 경로를 물어봅니다."
-echo "N을 입력하면 기본 경로를 사용합니다."
+echo "LIBERO 설치 검증 중..."
+
+# 환경변수 설정으로 자동 응답 처리
+export LIBERO_DATASETS=/content/libero_datasets
 
 python << 'LIBERO_CHECK'
 from libero.libero import benchmark

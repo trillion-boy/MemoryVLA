@@ -222,20 +222,18 @@ pip install -e .
 
 echo "✅ LIBERO 설치 완료"
 
-# LIBERO 설치 확인 (자동으로 기본 경로 사용)
+# LIBERO 설치 확인
 echo ""
-echo "LIBERO 설치 검증 중..."
-
-# 환경변수 설정으로 자동 응답 처리
-export LIBERO_DATASETS=/content/libero_datasets
-
-python << 'LIBERO_CHECK'
-from libero.libero import benchmark
-benchmark_dict = benchmark.get_benchmark_dict()
-task_suites = list(benchmark_dict.keys())
-print(f"✅ LIBERO import 성공")
-print(f"✅ Task suites: {task_suites}")
-LIBERO_CHECK
+echo "✅ LIBERO 설치 완료"
+echo ""
+echo "⚠️  LIBERO 검증은 별도 Python 셀에서 수행하세요 (interactive input 지원):"
+echo ""
+echo "import sys"
+echo "sys.path.insert(0, '/opt/conda/envs/memvla/lib/python3.10/site-packages')"
+echo "from libero.libero import benchmark"
+echo "benchmark_dict = benchmark.get_benchmark_dict()"
+echo "task_suites = list(benchmark_dict.keys())"
+echo "print(f'Task suites: {task_suites}')"
 """
 
 with open("/tmp/install_libero.sh", "w") as f:

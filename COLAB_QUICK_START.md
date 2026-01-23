@@ -161,19 +161,19 @@ echo "✅ LIBERO 설치 완료"
 
 **예상 시간**: 5-10분
 
-> **중요**: 다음 셀에서 LIBERO를 검증합니다. conda 환경에서 실행되어야 합니다.
+> **중요**: 다음 셀에서 LIBERO를 검증합니다. sys.path로 conda 환경에 접근하여 interactive input이 가능합니다!
 
 ---
 
-### **Step 3-B: LIBERO 설치 확인 (별도 셀)**
+### **Step 3-B: LIBERO 설치 확인 (별도 셀 - interactive input 가능!)**
 
 ```python
-%%bash
-# LIBERO 데이터셋 기본 경로 설정 (자동으로 'N' 선택)
-export LIBERO_DATASETS=/content/libero_datasets
+import sys
 
-# conda 환경의 Python 직접 실행 (conda activate 없이)
-/opt/conda/envs/memvla/bin/python -c "
+# conda 환경의 site-packages를 Python path에 추가
+sys.path.insert(0, '/opt/conda/envs/memvla/lib/python3.10/site-packages')
+
+# 이제 interactive input 가능!
 from libero.libero import benchmark
 
 benchmark_dict = benchmark.get_benchmark_dict()
@@ -181,12 +181,13 @@ task_suites = list(benchmark_dict.keys())
 
 print('✅ LIBERO import 성공')
 print(f'✅ Task suites: {task_suites}')
-"
 ```
+
+**데이터셋 경로를 물어보면 `N` 입력하세요!**
 
 **예상 출력**:
 ```
-Do you want to specify a custom path for the dataset folder? (Y/N): [자동으로 기본 경로 사용]
+Do you want to specify a custom path for the dataset folder? (Y/N): N
 ✅ LIBERO import 성공
 ✅ Task suites: ['libero_spatial', 'libero_object', 'libero_goal', 'libero_10', 'libero_90']
 ```

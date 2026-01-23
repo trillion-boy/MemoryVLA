@@ -169,13 +169,11 @@ echo "✅ LIBERO 설치 완료"
 
 ```python
 %%bash
-source /opt/conda/etc/profile.d/conda.sh
-conda activate memvla
-
 # LIBERO 데이터셋 기본 경로 설정 (자동으로 'N' 선택)
 export LIBERO_DATASETS=/content/libero_datasets
 
-python -c "
+# conda 환경의 Python 직접 실행 (conda activate 없이)
+/opt/conda/envs/memvla/bin/python -c "
 from libero.libero import benchmark
 
 benchmark_dict = benchmark.get_benchmark_dict()

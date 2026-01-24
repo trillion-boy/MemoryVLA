@@ -1,0 +1,62 @@
+# ============================================================
+# LIBERO Goal - Checkpoint 다운로드
+# ============================================================
+
+%%bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate memvla
+
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+export TOKENIZERS_PARALLELISM=false
+export LIBERO_DATASETS=/content/libero_datasets
+export PYTHONPATH=/content/third_libs/LIBERO:$PYTHONPATH
+export HF_TOKEN='your_huggingface_token_here'
+
+cd /content/MemoryVLA
+
+# Checkpoint 다운로드
+python -c "
+from huggingface_hub import snapshot_download
+import os
+checkpoint_path = snapshot_download(
+    repo_id='shihao1895/memvla-libero-goal',
+    cache_dir='/content/checkpoints',
+    resume_download=True,
+)
+pt_file = [f for f in os.listdir(f'{checkpoint_path}/checkpoints') if f.endswith('.pt')][0]
+with open('/content/checkpoint_path_goal.txt', 'w') as f:
+    f.write(f'{checkpoint_path}/checkpoints/{pt_file}')
+print(f'Checkpoint: {checkpoint_path}/checkpoints/{pt_file}')
+"
+
+
+# ============================================================
+# LIBERO Goal - 평가 실행 (5 tasks × 50 trials)
+# ============================================================
+
+%%bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate memvla
+
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+export TOKENIZERS_PARALLELISM=false
+export LIBERO_DATASETS=/content/libero_datasets
+export PYTHONPATH=/content/third_libs/LIBERO:$PYTHONPATH
+export HF_TOKEN='your_huggingface_token_here'
+
+cd /content/MemoryVLA
+
+CHECKPOINT_PATH=$(cat /content/checkpoint_path_goal.txt)
+
+python evaluation/libero/eval_libero_colab.py \
+    --checkpoint_path "$CHECKPOINT_PATH" \
+    --task_suite_name "libero_goal" \
+    --unnorm_key "libero_goal_no_noops" \
+    --num_trials_per_task 50 \
+    --seed 7 \
+    --use_bf16 \
+    --action_chunking_window 8 \
+    --log_dir "/content/logs/libero_goal_5tasks" \
+    --specific_task_ids 0 1 2 3 4

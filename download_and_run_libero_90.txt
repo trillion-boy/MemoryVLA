@@ -42,11 +42,11 @@ CHECKPOINT_PATH=$(cat /content/checkpoint_path_libero100.txt)
 
 python evaluation/libero/eval_libero_colab.py \
     --checkpoint_path "$CHECKPOINT_PATH" \
-    --task_suite_name "libero_10" \
-    --unnorm_key "libero_10_no_noops" \
+    --task_suite_name "libero_90" \
+    --unnorm_key "libero_90_no_noops" \
     --num_trials_per_task 50 \
     --seed 7 \
     --use_bf16 \
     --action_chunking_window 8 \
-    --log_dir "/content/logs/libero_long_5tasks" \
+    --log_dir "/content/logs/libero_90_5tasks" \
     --specific_task_ids 0 1 2 3 4

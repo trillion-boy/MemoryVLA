@@ -1,0 +1,53 @@
+# ============================================================
+# CALVIN Zero-shot Evaluation with MemoryVLA
+# Using LIBERO-pretrained checkpoint (no CALVIN training!)
+# ============================================================
+
+# Prerequisites:
+# 1. MemoryVLA setup completed (Step 1-3 from COLAB_QUICK_START.md)
+# 2. CALVIN installed (setup_calvin_colab.txt)
+# 3. LIBERO checkpoint downloaded (e.g., memvla-libero-spatial)
+
+%%bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate memvla
+
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+export TOKENIZERS_PARALLELISM=false
+export HF_TOKEN='your_huggingface_token_here'
+
+cd /content/MemoryVLA
+
+# Use LIBERO-Spatial checkpoint (pretrained, no CALVIN data!)
+CHECKPOINT_PATH=$(cat /content/checkpoint_path_spatial.txt)
+
+# If you don't have spatial checkpoint, download it:
+# python -c "
+# from huggingface_hub import snapshot_download
+# import os
+# checkpoint_path = snapshot_download(
+#     repo_id='shihao1895/memvla-libero-spatial',
+#     cache_dir='/content/checkpoints',
+#     resume_download=True,
+# )
+# pt_file = [f for f in os.listdir(f'{checkpoint_path}/checkpoints') if f.endswith('.pt')][0]
+# with open('/content/checkpoint_path_spatial.txt', 'w') as f:
+#     f.write(f'{checkpoint_path}/checkpoints/{pt_file}')
+# print(f'Checkpoint: {checkpoint_path}/checkpoints/{pt_file}')
+# "
+
+# Zero-shot evaluation on CALVIN
+python evaluation/calvin/eval_calvin_colab.py \
+    --checkpoint_path "$CHECKPOINT_PATH" \
+    --dataset_path "calvin_env/playdata/task_D_D/validation" \
+    --num_episodes 50 \
+    --unnorm_key "libero_spatial_no_noops" \
+    --use_bf16 \
+    --action_chunking_window 8 \
+    --log_dir "/content/logs/calvin_zero_shot"
+
+# This is ZERO-SHOT because:
+# - Checkpoint was trained on LIBERO only
+# - No fine-tuning on CALVIN data
+# - Direct transfer to unseen environment

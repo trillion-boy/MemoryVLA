@@ -1,32 +1,20 @@
 # ============================================================
 # CALVIN Setup for Google Colab
+# Prerequisites: MemoryVLA already installed (Python 3.10, memvla env)
+# This installs CALVIN into the existing memvla environment
 # ============================================================
 
-# Step 1: Install Miniforge (Python 3.8 environment)
-%%bash
-wget https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh
-bash Miniforge3-Linux-x86_64.sh -b -p /opt/conda
-rm Miniforge3-Linux-x86_64.sh
-
-# Step 2: Create Calvin environment
-%%bash
-source /opt/conda/etc/profile.d/conda.sh
-conda create -n calvin_venv python=3.8 -y
-conda activate calvin_venv
-
-# Verify Python version
-python --version
-
-# Step 3: Clone CALVIN repository
+# Step 1: Clone CALVIN repository
 %%bash
 cd /content
 git clone --recurse-submodules https://github.com/mees/calvin.git
 export CALVIN_ROOT=/content/calvin
+echo "✅ CALVIN repository cloned"
 
-# Step 4: Install dependencies
+# Step 2: Install CALVIN in memvla environment (Python 3.10)
 %%bash
 source /opt/conda/etc/profile.d/conda.sh
-conda activate calvin_venv
+conda activate memvla
 
 cd /content/calvin
 
@@ -34,7 +22,7 @@ cd /content/calvin
 pip install wheel
 pip install cmake==3.18.4
 
-# Install tacto (if needed, can skip for inference)
+# Install tacto (tactile sensing, can skip for inference-only)
 cd calvin_env/tacto
 pip install -e .
 
@@ -42,37 +30,53 @@ pip install -e .
 cd /content/calvin/calvin_env
 pip install -e .
 
-# Install calvin_models (for policy loading)
+# Install calvin_models (for policy loading if needed)
 cd /content/calvin/calvin_models
 pip install -e .
 
-# Downgrade setuptools if pyhash fails
+# Downgrade setuptools if pyhash installation fails
 pip install 'setuptools<58'
 
-# Step 5: Download dataset (debug version for testing)
+echo "✅ CALVIN installed in memvla environment (Python 3.10)"
+
+# Step 3: Download CALVIN dataset (debug version for testing)
 %%bash
 source /opt/conda/etc/profile.d/conda.sh
-conda activate calvin_venv
+conda activate memvla
 
 cd /content/calvin/dataset
 sh download_data.sh debug
 
-# This downloads ~1.3GB debug dataset
+# This downloads ~1.3GB debug dataset for quick testing
 # For full dataset: sh download_data.sh D (or ABC, ABCD)
+echo "✅ CALVIN debug dataset downloaded (~1.3GB)"
 
-# Step 6: Test installation
+# Step 4: Test CALVIN installation
 %%bash
 source /opt/conda/etc/profile.d/conda.sh
-conda activate calvin_venv
+conda activate memvla
 
 cd /content/calvin
 
 python -c "
+import sys
+print(f'Python version: {sys.version}')
+
 import gym
 import calvin_env
-print('✅ CALVIN environment installed successfully!')
+print('✅ CALVIN environment imported successfully!')
 
 # Test environment creation
-env = gym.make('calvin_env/playdata/task_D_D/validation')
-print(f'✅ Environment created: {env}')
+env = gym.make('calvin/playdata/task_D_D/validation')
+print(f'✅ CALVIN environment created: {env}')
+obs = env.reset()
+print(f'✅ Environment reset successful')
+print(f'   Observation keys: {obs.keys()}')
 "
+
+echo ""
+echo "========================================"
+echo "✅ CALVIN Setup Complete!"
+echo "   Environment: memvla (Python 3.10)"
+echo "   CALVIN + MemoryVLA ready for zero-shot eval"
+echo "========================================"

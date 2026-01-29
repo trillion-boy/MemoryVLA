@@ -237,8 +237,8 @@ def eval_calvin_colab(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Zero-shot CALVIN evaluation for MemoryVLA")
     parser.add_argument("--checkpoint_path", type=str, required=True, help="Path to MemoryVLA checkpoint")
-    parser.add_argument("--dataset_path", type=str, default="calvin_env/playdata/task_D_D/validation",
-                        help="CALVIN dataset path")
+    parser.add_argument("--dataset_path", type=str, default="calvin/playdata/task_D_D/validation",
+                        help="CALVIN dataset path (use Task D validation for standard benchmark)")
     parser.add_argument("--num_episodes", type=int, default=50, help="Number of episodes")
     parser.add_argument("--unnorm_key", type=str, default="libero_spatial_no_noops",
                         help="Unnormalization key from training dataset")

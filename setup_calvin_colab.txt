@@ -39,17 +39,31 @@ pip install 'setuptools<58'
 
 echo "✅ CALVIN installed in memvla environment (Python 3.10)"
 
-# Step 3: Download CALVIN dataset (debug version for testing)
+# Step 3: Download CALVIN dataset
+
+# Option 1: Debug dataset (코드 테스트 전용, evaluation 부적합)
+# %%bash
+# source /opt/conda/etc/profile.d/conda.sh
+# conda activate memvla
+# cd /content/calvin/dataset
+# sh download_data.sh debug
+# echo "✅ CALVIN debug dataset downloaded (~1.3GB)"
+
+# Option 2: Task D (추천 - 실제 evaluation용, ~30-50GB)
 %%bash
 source /opt/conda/etc/profile.d/conda.sh
 conda activate memvla
 
 cd /content/calvin/dataset
-sh download_data.sh debug
+sh download_data.sh D
 
-# This downloads ~1.3GB debug dataset for quick testing
-# For full dataset: sh download_data.sh D (or ABC, ABCD)
-echo "✅ CALVIN debug dataset downloaded (~1.3GB)"
+# Task D: 표준 benchmark evaluation split
+# ABC→D: A,B,C로 학습, D에서 테스트 (unseen environment)
+# 우리는 validation set만 사용 (LIBERO checkpoint로 zero-shot test)
+echo "✅ CALVIN Task D dataset downloaded (~30-50GB)"
+
+# Option 3: Full ABCD (모든 환경, ~120GB+, 시간 오래 걸림)
+# sh download_data.sh ABCD
 
 # Step 4: Test CALVIN installation
 %%bash

@@ -1,0 +1,129 @@
+================================================================================
+RoboCasa Zero-Shot Evaluation for MemoryVLA
+================================================================================
+
+Prerequisites:
+1. MemoryVLA installed in memvla conda environment
+2. LIBERO-Spatial checkpoint downloaded
+3. RoboCasa installed (see installation steps below)
+
+================================================================================
+INSTALLATION (Colab)
+================================================================================
+
+Step 1: Install RoboCasa
+-------------------------
+%%bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate memvla
+
+# Install RoboSuite (dependency)
+cd /content
+git clone https://github.com/ARISE-Initiative/robosuite
+cd robosuite
+pip install -e .
+
+# Install RoboCasa
+cd /content
+git clone https://github.com/robocasa/robocasa
+cd robocasa
+pip install -e .
+
+Step 2: Download Kitchen Assets (5GB)
+--------------------------------------
+python
+import sys
+sys.path.append('/content/robocasa')
+!python /content/robocasa/robocasa/scripts/download_kitchen_assets.py
+!python /content/robocasa/robocasa/scripts/setup_macros.py
+
+
+================================================================================
+EVALUATION
+================================================================================
+
+Basic Evaluation (10 atomic tasks, 10 episodes each)
+-----------------------------------------------------
+%%bash
+source /opt/conda/etc/profile.d/conda.sh
+conda activate memvla
+
+CHECKPOINT_PATH=$(cat /content/checkpoint_path_spatial.txt)
+
+python /content/MemoryVLA/evaluation/robocasa/eval_robocasa_colab.py \
+    --checkpoint_path "$CHECKPOINT_PATH" \
+    --unnorm_key "libero_spatial_no_noops" \
+    --num_episodes 10 \
+    --max_steps 400 \
+    --use_bf16 \
+    --action_chunking_window 8 \
+    --log_dir "/content/logs/robocasa_zero_shot"
+
+
+Custom Task Evaluation
+-----------------------
+# Evaluate specific tasks
+python evaluation/robocasa/eval_robocasa_colab.py \
+    --checkpoint_path "$CHECKPOINT_PATH" \
+    --unnorm_key "libero_spatial_no_noops" \
+    --num_episodes 20 \
+    --tasks PnPCounterToCab OpenSingleDoor TurnOnMicrowave
+
+
+================================================================================
+AVAILABLE TASKS (Sample)
+================================================================================
+
+Atomic Tasks (25 total):
+- PnPCounterToCab: Pick and place from counter to cabinet
+- PnPCabToCounter: Pick and place from cabinet to counter
+- PnPCounterToSink: Pick and place from counter to sink
+- PnPSinkToCounter: Pick and place from sink to counter
+- PnPCounterToMicrowave: Pick and place from counter to microwave
+- OpenSingleDoor: Open a single cabinet door
+- CloseSingleDoor: Close a single cabinet door
+- TurnOnMicrowave: Turn on the microwave
+- TurnOffMicrowave: Turn off the microwave
+- TurnOnSinkFaucet: Turn on sink faucet
+- TurnOffSinkFaucet: Turn off sink faucet
+
+Composite Tasks (75 total):
+- More complex multi-step tasks combining atomic actions
+
+
+================================================================================
+EXPECTED RESULTS
+================================================================================
+
+Zero-shot performance (LIBERO checkpoint on RoboCasa):
+- Expected: 10-30% success rate (significant domain gap)
+- LIBERO tasks use tabletop manipulation in simple scenes
+- RoboCasa uses household kitchens with diverse objects/layouts
+
+This is a good OOD (Out-of-Distribution) generalization test!
+
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+1. MuJoCo rendering errors on Colab:
+   - Normal! Colab doesn't support onscreen rendering
+   - Evaluation still works (rendering not needed for metrics)
+
+2. Action dimension mismatch:
+   - RoboCasa expects 7D actions: [dx, dy, dz, droll, dpitch, dyaw, gripper]
+   - MemoryVLA outputs 7D for LIBERO (compatible!)
+
+3. Memory issues:
+   - Reduce num_episodes if OOM
+   - Use --use_bf16 flag (already default)
+
+
+================================================================================
+REFERENCES
+================================================================================
+
+- RoboCasa Paper: https://robocasa.ai/assets/robocasa_rss24.pdf
+- RoboCasa Docs: https://robocasa.ai/docs/
+- GitHub: https://github.com/robocasa/robocasa

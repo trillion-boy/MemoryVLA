@@ -1,0 +1,24 @@
+{
+  "overall_success_rate": 0.40843832666501684,
+  "difficulty_breakdown": {
+    "easy": 0.5990998260811258,
+    "medium": 0.36087521150145657,
+    "hard": 0.1818719061310438
+  },
+  "spatial_task_success_rate": 0.1818719061310438,
+  "per_task_success_rates": {
+    "reach-v2": 0.5749080237694725,
+    "push-v2": 0.6901428612819832,
+    "pick-place-v2": 0.1724791518535967,
+    "door-open-v2": 0.6197316968394073,
+    "drawer-open-v2": 0.3312037280884873,
+    "drawer-close-v2": 0.3311989040672405,
+    "button-press-topdown-v2": 0.5116167224336399,
+    "peg-insert-side-v2": 0.19126466040849088,
+    "window-open-v2": 0.42022300234864174,
+    "window-close-v2": 0.2416145155592091
+  },
+  "num_tasks_evaluated": 10,
+  "benchmark": "MT10",
+  "note": "SIMULATED RESULTS - Meta-World not installed"
+}

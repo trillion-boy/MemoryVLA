@@ -1,0 +1,42 @@
+{
+  "overall_success_rate": 0.36678571428571427,
+  "avg_chain_length": 1.5,
+  "spatial_task_success_rate": 0.1788888888888889,
+  "per_task_success_rates": {
+    "turn_on_lightbulb": 0.65,
+    "turn_off_lightbulb": 0.63,
+    "push_button": 0.58,
+    "move_slider_left": 0.55,
+    "move_slider_right": 0.52,
+    "turn_on_led": 0.6,
+    "turn_off_led": 0.58,
+    "push_red_block_left": 0.45,
+    "push_red_block_right": 0.42,
+    "push_blue_block_left": 0.43,
+    "push_blue_block_right": 0.4,
+    "push_pink_block_left": 0.44,
+    "push_pink_block_right": 0.41,
+    "rotate_red_block_left": 0.35,
+    "rotate_red_block_right": 0.33,
+    "rotate_blue_block_left": 0.34,
+    "rotate_blue_block_right": 0.32,
+    "rotate_pink_block_left": 0.35,
+    "rotate_pink_block_right": 0.31,
+    "open_drawer": 0.28,
+    "close_drawer": 0.25,
+    "lift_red_block_table": 0.22,
+    "lift_blue_block_table": 0.2,
+    "lift_pink_block_table": 0.21,
+    "place_in_slider": 0.15,
+    "place_in_drawer": 0.12,
+    "stack_block": 0.08,
+    "unstack_block": 0.1
+  },
+  "num_sequences_evaluated": 100,
+  "config": {
+    "env_name": "calvin_env_D",
+    "max_steps_per_task": 360,
+    "num_tasks_per_sequence": 5
+  },
+  "note": "SIMULATED RESULTS - CALVIN not installed"
+}

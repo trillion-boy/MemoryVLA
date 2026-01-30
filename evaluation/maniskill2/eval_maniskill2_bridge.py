@@ -45,9 +45,12 @@ def check_dependencies():
         missing.append("torch")
 
     try:
-        import mani_skill2
+        import mani_skill
     except ImportError:
-        missing.append("mani-skill2")
+        try:
+            import mani_skill2 as mani_skill
+        except ImportError:
+            missing.append("mani-skill")
 
     try:
         from PIL import Image
@@ -77,18 +80,28 @@ class EvalConfig:
     sim_freq: int = 513
     render_mode: str = "cameras"
 
-    # Tasks to evaluate
+    # Tasks to evaluate (ManiSkill v3 compatible names)
     tasks: List[str] = field(default_factory=lambda: [
-        "PickCube-v0",
-        "StackCube-v0",
-        "PickSingleYCB-v0",
-        "PickSingleEGAD-v0",
-        "PickClutterYCB-v0",
+        "PickCube-v1",
+        "StackCube-v1",
+        "PegInsertionSide-v1",
+        "PickSingleYCB-v1",
+        "PlugCharger-v1",
     ])
 
 
-# Task descriptions for language conditioning
+# Task descriptions for language conditioning (supports both v0 and v1)
 TASK_DESCRIPTIONS = {
+    # ManiSkill v3 (v1 suffix)
+    "PickCube-v1": "pick up the red cube",
+    "StackCube-v1": "stack the red cube on the green cube",
+    "PickSingleYCB-v1": "pick up the object",
+    "PickSingleEGAD-v1": "pick up the object",
+    "PickClutterYCB-v1": "pick up the target object from the clutter",
+    "PegInsertionSide-v1": "insert the peg into the hole",
+    "PlugCharger-v1": "plug the charger into the socket",
+    "AssemblingKits-v1": "assemble the kit",
+    # ManiSkill v2 (v0 suffix) - fallback
     "PickCube-v0": "pick up the red cube",
     "StackCube-v0": "stack the red cube on the green cube",
     "PickSingleYCB-v0": "pick up the object",
@@ -96,14 +109,14 @@ TASK_DESCRIPTIONS = {
     "PickClutterYCB-v0": "pick up the target object from the clutter",
     "PegInsertionSide-v0": "insert the peg into the hole",
     "PlugCharger-v0": "plug the charger into the socket",
-    "AssemblingKits-v0": "assemble the kit",
 }
 
 # Tasks requiring good 3D understanding (where 3DGS can help)
 SPATIAL_TASKS = [
-    "StackCube-v0",  # Stacking requires precise 3D alignment
-    "PegInsertionSide-v0",  # Insertion requires depth understanding
-    "PickClutterYCB-v0",  # Clutter requires 3D scene understanding
+    "StackCube-v1", "StackCube-v0",  # Stacking requires precise 3D alignment
+    "PegInsertionSide-v1", "PegInsertionSide-v0",  # Insertion requires depth understanding
+    "PickClutterYCB-v1", "PickClutterYCB-v0",  # Clutter requires 3D scene understanding
+    "PlugCharger-v1", "PlugCharger-v0",  # Precise insertion task
 ]
 
 
@@ -152,18 +165,30 @@ class ManiSkill2Evaluator:
             self.model = None
 
     def setup_environment(self, task_name: str):
-        """Create ManiSkill2 environment"""
-        import mani_skill2.envs
+        """Create ManiSkill environment"""
         import gymnasium as gym
 
-        env = gym.make(
-            task_name,
-            obs_mode="rgbd",
-            control_mode="pd_ee_delta_pos",
-            render_mode=self.config.render_mode,
-            sim_freq=self.config.sim_freq,
-            control_freq=self.config.control_freq,
-        )
+        # Try ManiSkill v3 first, fallback to v2
+        try:
+            import mani_skill.envs
+        except ImportError:
+            import mani_skill2.envs
+
+        # ManiSkill v3 uses slightly different API
+        try:
+            env = gym.make(
+                task_name,
+                obs_mode="rgbd",
+                control_mode="pd_ee_delta_pos",
+                render_mode=self.config.render_mode,
+            )
+        except TypeError:
+            # Fallback for different API versions
+            env = gym.make(
+                task_name,
+                obs_mode="rgbd",
+                control_mode="pd_ee_delta_pos",
+            )
 
         return env
 

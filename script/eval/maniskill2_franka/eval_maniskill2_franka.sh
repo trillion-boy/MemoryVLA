@@ -1,143 +1,130 @@
 #!/bin/bash
-# Evaluation script for testing LIBERO-trained models on ManiSkill2 Franka Panda environments
-# This enables cross-environment generalization testing with the same robot (Franka Panda)
+# ============================================================================
+# Cross-Environment Generalization Evaluation Script
+# ============================================================================
+# Tests LIBERO-trained MemoryVLA models on ManiSkill2 Franka Panda environments
+#
+# Key Point: Same robot (Franka Panda), different environments and objects
+# - Training: LIBERO (Franka Panda) - kitchen/tabletop manipulation
+# - Testing: ManiSkill2 (Franka Panda) - various pick/place tasks
+#
+# This tests the model's ability to generalize to UNSEEN environments
+# while keeping the robot embodiment fixed.
+# ============================================================================
 
-# LIBERO checkpoint paths (trained on LIBERO with Franka Panda)
-ckpt_paths=(
-/PATH/TO/YOUR/LIBERO_CHECKPOINT_1
-/PATH/TO/YOUR/LIBERO_CHECKPOINT_2
-# Example: ./checkpoints/libero_spatial/step-032500-epoch-03-loss=0.0455.pt
-)
+# ============================================
+# Configuration - MODIFY THESE
+# ============================================
 
-gpu_id=0
+# Your LIBERO checkpoint path
+# Examples:
+#   - LIBERO-Spatial: ./checkpoints/libero_spatial/step-XXXXX.pt
+#   - LIBERO-Object:  ./checkpoints/libero_object/step-XXXXX.pt
+#   - LIBERO-Goal:    ./checkpoints/libero_goal/step-XXXXX.pt
+#   - LIBERO-100:     ./checkpoints/libero_100/step-XXXXX.pt
+CKPT_PATH="/PATH/TO/YOUR/LIBERO_CHECKPOINT.pt"
 
-# ManiSkill2 Franka Panda environments for generalization testing
-# These environments use Franka Panda robot, same as LIBERO
+# Unnormalization key - must match your LIBERO training dataset
+# Options: libero_spatial_no_noops, libero_object_no_noops, libero_goal_no_noops, libero_90_no_noops
+UNNORM_KEY="libero_spatial_no_noops"
 
-for ckpt_path in "${ckpt_paths[@]}"; do
-    eval_dir=$(dirname $(dirname ${ckpt_path}))/eval_maniskill2_franka/$(basename ${ckpt_path})
-    mkdir -p ${eval_dir}
+# GPU to use
+GPU_ID=0
 
-    # Common settings for Franka Panda in ManiSkill2
-    robot=panda
-    scene_name=defaults
+# Number of evaluation episodes per task
+NUM_EPISODES=50
 
-    # Robot initial position (typical for ManiSkill2 tabletop tasks)
-    robot_init_x=0.0
-    robot_init_y=0.0
+# Output directory
+EVAL_DIR="./eval_results/maniskill2_generalization/$(basename ${CKPT_PATH%.pt})"
+mkdir -p ${EVAL_DIR}
 
-    # ============================================
-    # Task 1: PickCube-v0
-    # Simple cube picking task
-    # ============================================
-    echo "Evaluating PickCube-v0..."
-    CUDA_VISIBLE_DEVICES=${gpu_id} python evaluation/simpler_env/simpler_env_inference.py \
-      --ckpt-path ${ckpt_path} \
-      --robot ${robot} \
-      --policy-setup franka_panda \
-      --control-freq 3 \
-      --sim-freq 513 \
-      --max-episode-steps 100 \
-      --env-name PickCube-v0 \
-      --scene-name ${scene_name} \
-      --robot-init-x ${robot_init_x} ${robot_init_x} 1 \
-      --robot-init-y ${robot_init_y} ${robot_init_y} 1 \
-      --obj-variation-mode episode \
-      --obj-episode-range 0 50 \
-      --robot-init-rot-quat-center 0 0 0 1 \
-      --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
-      | tee ${eval_dir}/PickCube.txt
+# ============================================
+# ManiSkill2 Franka Panda Tasks
+# ============================================
+# All these tasks use Franka Panda robot (same as LIBERO)
+# Reference: https://maniskill2.github.io/
 
-    # ============================================
-    # Task 2: StackCube-v0
-    # Stack one cube on another
-    # ============================================
-    echo "Evaluating StackCube-v0..."
-    CUDA_VISIBLE_DEVICES=${gpu_id} python evaluation/simpler_env/simpler_env_inference.py \
-      --ckpt-path ${ckpt_path} \
-      --robot ${robot} \
-      --policy-setup franka_panda \
-      --control-freq 3 \
-      --sim-freq 513 \
-      --max-episode-steps 150 \
-      --env-name StackCube-v0 \
-      --scene-name ${scene_name} \
-      --robot-init-x ${robot_init_x} ${robot_init_x} 1 \
-      --robot-init-y ${robot_init_y} ${robot_init_y} 1 \
-      --obj-variation-mode episode \
-      --obj-episode-range 0 50 \
-      --robot-init-rot-quat-center 0 0 0 1 \
-      --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
-      | tee ${eval_dir}/StackCube.txt
+echo "============================================"
+echo "Cross-Environment Generalization Evaluation"
+echo "============================================"
+echo "Checkpoint: ${CKPT_PATH}"
+echo "Unnorm Key: ${UNNORM_KEY}"
+echo "Output Dir: ${EVAL_DIR}"
+echo "============================================"
 
-    # ============================================
-    # Task 3: PickSingleYCB-v0
-    # Pick various YCB objects
-    # ============================================
-    echo "Evaluating PickSingleYCB-v0..."
-    CUDA_VISIBLE_DEVICES=${gpu_id} python evaluation/simpler_env/simpler_env_inference.py \
-      --ckpt-path ${ckpt_path} \
-      --robot ${robot} \
-      --policy-setup franka_panda \
-      --control-freq 3 \
-      --sim-freq 513 \
-      --max-episode-steps 100 \
-      --env-name PickSingleYCB-v0 \
-      --scene-name ${scene_name} \
-      --robot-init-x ${robot_init_x} ${robot_init_x} 1 \
-      --robot-init-y ${robot_init_y} ${robot_init_y} 1 \
-      --obj-variation-mode episode \
-      --obj-episode-range 0 50 \
-      --robot-init-rot-quat-center 0 0 0 1 \
-      --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
-      | tee ${eval_dir}/PickSingleYCB.txt
+# Task 1: PickCube-v0
+# Simple cube picking - tests basic grasping generalization
+echo -e "\n[1/5] Evaluating PickCube-v0..."
+CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
+    --ckpt-path ${CKPT_PATH} \
+    --env-name "PickCube-v0" \
+    --task-instruction "pick up the red cube" \
+    --unnorm-key ${UNNORM_KEY} \
+    --num-episodes ${NUM_EPISODES} \
+    --max-steps 100 \
+    --save-dir ${EVAL_DIR} \
+    2>&1 | tee ${EVAL_DIR}/PickCube.log
 
-    # ============================================
-    # Task 4: PickSingleEGAD-v0
-    # Pick EGAD objects (more diverse shapes)
-    # ============================================
-    echo "Evaluating PickSingleEGAD-v0..."
-    CUDA_VISIBLE_DEVICES=${gpu_id} python evaluation/simpler_env/simpler_env_inference.py \
-      --ckpt-path ${ckpt_path} \
-      --robot ${robot} \
-      --policy-setup franka_panda \
-      --control-freq 3 \
-      --sim-freq 513 \
-      --max-episode-steps 100 \
-      --env-name PickSingleEGAD-v0 \
-      --scene-name ${scene_name} \
-      --robot-init-x ${robot_init_x} ${robot_init_x} 1 \
-      --robot-init-y ${robot_init_y} ${robot_init_y} 1 \
-      --obj-variation-mode episode \
-      --obj-episode-range 0 50 \
-      --robot-init-rot-quat-center 0 0 0 1 \
-      --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
-      | tee ${eval_dir}/PickSingleEGAD.txt
+# Task 2: StackCube-v0
+# Stack cube on cube - tests sequential manipulation
+echo -e "\n[2/5] Evaluating StackCube-v0..."
+CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
+    --ckpt-path ${CKPT_PATH} \
+    --env-name "StackCube-v0" \
+    --task-instruction "stack the red cube on the green cube" \
+    --unnorm-key ${UNNORM_KEY} \
+    --num-episodes ${NUM_EPISODES} \
+    --max-steps 150 \
+    --save-dir ${EVAL_DIR} \
+    2>&1 | tee ${EVAL_DIR}/StackCube.log
 
-    # ============================================
-    # Task 5: PickClutterYCB-v0
-    # Pick objects from cluttered scene
-    # ============================================
-    echo "Evaluating PickClutterYCB-v0..."
-    CUDA_VISIBLE_DEVICES=${gpu_id} python evaluation/simpler_env/simpler_env_inference.py \
-      --ckpt-path ${ckpt_path} \
-      --robot ${robot} \
-      --policy-setup franka_panda \
-      --control-freq 3 \
-      --sim-freq 513 \
-      --max-episode-steps 150 \
-      --env-name PickClutterYCB-v0 \
-      --scene-name ${scene_name} \
-      --robot-init-x ${robot_init_x} ${robot_init_x} 1 \
-      --robot-init-y ${robot_init_y} ${robot_init_y} 1 \
-      --obj-variation-mode episode \
-      --obj-episode-range 0 50 \
-      --robot-init-rot-quat-center 0 0 0 1 \
-      --robot-init-rot-rpy-range 0 0 1 0 0 1 0 0 1 \
-      | tee ${eval_dir}/PickClutterYCB.txt
+# Task 3: PickSingleYCB-v0
+# Pick YCB objects - tests object shape generalization (unseen objects)
+echo -e "\n[3/5] Evaluating PickSingleYCB-v0..."
+CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
+    --ckpt-path ${CKPT_PATH} \
+    --env-name "PickSingleYCB-v0" \
+    --task-instruction "pick up the object" \
+    --unnorm-key ${UNNORM_KEY} \
+    --num-episodes ${NUM_EPISODES} \
+    --max-steps 100 \
+    --save-dir ${EVAL_DIR} \
+    2>&1 | tee ${EVAL_DIR}/PickSingleYCB.log
 
-    echo "Done evaluating: ${ckpt_path}"
-done
+# Task 4: PickSingleEGAD-v0
+# Pick EGAD objects - tests more diverse shape generalization
+echo -e "\n[4/5] Evaluating PickSingleEGAD-v0..."
+CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
+    --ckpt-path ${CKPT_PATH} \
+    --env-name "PickSingleEGAD-v0" \
+    --task-instruction "pick up the object" \
+    --unnorm-key ${UNNORM_KEY} \
+    --num-episodes ${NUM_EPISODES} \
+    --max-steps 100 \
+    --save-dir ${EVAL_DIR} \
+    2>&1 | tee ${EVAL_DIR}/PickSingleEGAD.log
 
-wait
-echo "All evaluations complete!"
+# Task 5: PickClutterYCB-v0
+# Pick from clutter - tests visual reasoning in complex scenes
+echo -e "\n[5/5] Evaluating PickClutterYCB-v0..."
+CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
+    --ckpt-path ${CKPT_PATH} \
+    --env-name "PickClutterYCB-v0" \
+    --task-instruction "pick up the target object" \
+    --unnorm-key ${UNNORM_KEY} \
+    --num-episodes ${NUM_EPISODES} \
+    --max-steps 150 \
+    --save-dir ${EVAL_DIR} \
+    2>&1 | tee ${EVAL_DIR}/PickClutterYCB.log
+
+# ============================================
+# Summary
+# ============================================
+echo -e "\n============================================"
+echo "Evaluation Complete!"
+echo "============================================"
+echo "Results saved to: ${EVAL_DIR}"
+echo ""
+echo "To extract summary:"
+echo "  python script/eval/maniskill2_franka/extract_maniskill2_franka_results.py --eval-dir ${EVAL_DIR}"
+echo "============================================"

@@ -50,6 +50,16 @@ class VLAInference:
                 # Set 2 for google_robot to fix the window size of motion scale between each frame. see appendix in our paper for details
                 action_ensemble_horizon = 2
             self.sticky_gripper_num_repeat = 10
+        elif policy_setup == "franka_panda":
+            # Franka Panda setup for LIBERO-trained models tested on ManiSkill2 environments
+            # Use libero dataset normalization stats for cross-environment generalization testing
+            unnorm_key = unnorm_key if unnorm_key is not None else "libero_spatial_no_noops"
+            action_ensemble = action_ensemble
+            adaptive_ensemble_alpha = adaptive_ensemble_alpha
+            if action_ensemble_horizon is None:
+                # Similar to widowx_bridge, set 7 for stable motion scaling
+                action_ensemble_horizon = 7
+            self.sticky_gripper_num_repeat = 1
         else:
             raise NotImplementedError(
                 f"Policy setup {policy_setup} not supported for octo models. The other datasets can be found in the huggingface config.json file."
@@ -192,7 +202,12 @@ class VLAInference:
 
         elif self.policy_setup == "widowx_bridge":
             action["gripper"] = 2.0 * (raw_action["open_gripper"] > 0.5) - 1.0
-        
+
+        elif self.policy_setup == "franka_panda":
+            # Franka Panda gripper: normalize from [0,1] to [-1,+1] and binarize
+            # Similar to LIBERO's normalize_gripper_action in robot_utils.py
+            action["gripper"] = 2.0 * (raw_action["open_gripper"] > 0.5) - 1.0
+
         action["terminate_episode"] = np.array([0.0])
         return raw_action, action
 

@@ -45,24 +45,28 @@ def create_maniskill2_env(
     """
     try:
         import gymnasium as gym
+        from gymnasium.wrappers import TimeLimit
         import mani_skill2.envs  # Register ManiSkill2 environments
         env = gym.make(
             env_name,
             obs_mode=obs_mode,
             control_mode=control_mode,
             render_mode=render_mode,
-            max_episode_steps=max_episode_steps,
         )
+        # Wrap with TimeLimit to enforce max_episode_steps
+        env = TimeLimit(env, max_episode_steps=max_episode_steps)
     except ImportError:
         # Fallback to older gym
         import gym
+        from gym.wrappers import TimeLimit
         import mani_skill2.envs
         env = gym.make(
             env_name,
             obs_mode=obs_mode,
             control_mode=control_mode,
-            max_episode_steps=max_episode_steps,
         )
+        # Wrap with TimeLimit to enforce max_episode_steps
+        env = TimeLimit(env, max_episode_steps=max_episode_steps)
 
     return env
 

@@ -58,7 +58,7 @@ echo -e "\n[1/5] Evaluating PickCube-v0..."
 CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
     --ckpt-path ${CKPT_PATH} \
     --env-name "PickCube-v0" \
-    --task-instruction "pick up the red cube" \
+    --task-instruction "Grasp the small red cube on the table with the gripper, lift it up, and move it to the green target sphere hovering in the air." \
     --unnorm-key ${UNNORM_KEY} \
     --num-episodes ${NUM_EPISODES} \
     --max-steps 100 \
@@ -71,7 +71,7 @@ echo -e "\n[2/5] Evaluating StackCube-v0..."
 CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
     --ckpt-path ${CKPT_PATH} \
     --env-name "StackCube-v0" \
-    --task-instruction "stack the red cube on the green cube" \
+    --task-instruction "Pick up the small red cube from the table and carefully stack it on top of the green cube. Align the red cube above the green cube and place it down steadily." \
     --unnorm-key ${UNNORM_KEY} \
     --num-episodes ${NUM_EPISODES} \
     --max-steps 150 \
@@ -84,7 +84,7 @@ echo -e "\n[3/5] Evaluating PickSingleYCB-v0..."
 CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
     --ckpt-path ${CKPT_PATH} \
     --env-name "PickSingleYCB-v0" \
-    --task-instruction "pick up the object" \
+    --task-instruction "Grasp the object on the table with the gripper and lift it up to the goal position above the table." \
     --unnorm-key ${UNNORM_KEY} \
     --num-episodes ${NUM_EPISODES} \
     --max-steps 100 \
@@ -97,7 +97,7 @@ echo -e "\n[4/5] Evaluating PickSingleEGAD-v0..."
 CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
     --ckpt-path ${CKPT_PATH} \
     --env-name "PickSingleEGAD-v0" \
-    --task-instruction "pick up the object" \
+    --task-instruction "Grasp the object on the table with the gripper and lift it up to the goal position above the table." \
     --unnorm-key ${UNNORM_KEY} \
     --num-episodes ${NUM_EPISODES} \
     --max-steps 100 \
@@ -110,7 +110,7 @@ echo -e "\n[5/5] Evaluating PickClutterYCB-v0..."
 CUDA_VISIBLE_DEVICES=${GPU_ID} python evaluation/maniskill2/maniskill2_evaluator.py \
     --ckpt-path ${CKPT_PATH} \
     --env-name "PickClutterYCB-v0" \
-    --task-instruction "pick up the target object" \
+    --task-instruction "Identify the target object among the clutter on the table, grasp it with the gripper, and lift it up to the goal position." \
     --unnorm-key ${UNNORM_KEY} \
     --num-episodes ${NUM_EPISODES} \
     --max-steps 150 \

@@ -220,6 +220,9 @@ def run_evaluation(
     save_videos: bool = True,
     save_depth_vis: bool = True,
     verbose: bool = True,
+    # Sensor resolution (default 128x128 is too low for depth features)
+    sensor_width: int = 256,
+    sensor_height: int = 256,
     # Depth pipeline parameters
     alpha: float = 0.3,
     use_depth_injection: bool = True,
@@ -274,6 +277,7 @@ def run_evaluation(
         num_envs=1,
         render_mode="rgb_array",
         max_episode_steps=max_steps,
+        sensor_configs=dict(width=sensor_width, height=sensor_height),
     )
 
     # Get camera info
@@ -292,6 +296,7 @@ def run_evaluation(
         print(f"Max steps: {max_steps}")
         print(f"Unnorm key: {unnorm_key}")
         print(f"Camera: {camera_name}")
+        print(f"Sensor resolution: {sensor_width}x{sensor_height} (default: 128x128)")
         print(f"{'='*60}")
         print(f"Depth Pipeline Config:")
         print(f"  Step A (Depth Injection): {'ON' if use_depth_injection else 'OFF'}")

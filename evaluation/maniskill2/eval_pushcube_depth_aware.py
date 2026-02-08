@@ -220,9 +220,11 @@ def run_evaluation(
     save_videos: bool = True,
     save_depth_vis: bool = True,
     verbose: bool = True,
-    # Sensor resolution (default 128x128 is too low for depth features)
-    sensor_width: int = 256,
-    sensor_height: int = 256,
+    # Sensor resolution (ManiSkill default is 128x128)
+    # Use 128x128 for fair comparison with baseline MemoryVLA
+    # Use 256x256 for higher quality depth features (separate experiment)
+    sensor_width: int = 128,
+    sensor_height: int = 128,
     # Depth pipeline parameters
     alpha: float = 0.3,
     use_depth_injection: bool = True,
@@ -296,7 +298,7 @@ def run_evaluation(
         print(f"Max steps: {max_steps}")
         print(f"Unnorm key: {unnorm_key}")
         print(f"Camera: {camera_name}")
-        print(f"Sensor resolution: {sensor_width}x{sensor_height} (default: 128x128)")
+        print(f"Sensor resolution: {sensor_width}x{sensor_height}")
         print(f"{'='*60}")
         print(f"Depth Pipeline Config:")
         print(f"  Step A (Depth Injection): {'ON' if use_depth_injection else 'OFF'}")
@@ -371,6 +373,7 @@ def run_evaluation(
         "alpha": alpha,
         "use_depth_injection": use_depth_injection,
         "use_action_correction": use_action_correction,
+        "sensor_resolution": f"{sensor_width}x{sensor_height}",
         "camera_name": camera_name,
         "num_trials": num_trials,
         "max_steps": max_steps,
@@ -419,6 +422,7 @@ def run_evaluation(
         f.write(f"    - Depth source: ManiSkill GT\n\n")
         f.write(f"Environment Configuration:\n")
         f.write(f"  Environment: PushCube-v1\n")
+        f.write(f"  Sensor resolution: {sensor_width}x{sensor_height}\n")
         f.write(f"  Camera: {camera_name}\n")
         f.write(f"  Task: {task_instruction}\n")
         f.write(f"  Unnorm key: {unnorm_key}\n")
@@ -465,3 +469,9 @@ if __name__ == "__main__":
     print()
     print("  # Ablation: Step B only (no depth injection):")
     print("  results = run_evaluation(vla, use_depth_injection=False, use_action_correction=True)")
+    print()
+    print("  # Fair comparison experiments (same resolution for baseline & depth):")
+    print("  # 1. Baseline @128:  results = run_evaluation(vla, use_depth_injection=False, use_action_correction=False)")
+    print("  # 2. Depth   @128:  results = run_evaluation(vla, alpha=0.3)")
+    print("  # 3. Baseline @256:  results = run_evaluation(vla, use_depth_injection=False, use_action_correction=False, sensor_width=256, sensor_height=256)")
+    print("  # 4. Depth   @256:  results = run_evaluation(vla, alpha=0.3, sensor_width=256, sensor_height=256)")

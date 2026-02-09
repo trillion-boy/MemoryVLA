@@ -19,7 +19,10 @@ Usage (in Colab):
 """
 
 import gymnasium as gym
-import mani_skill.envs
+try:
+    import mani_skill.envs  # ManiSkill3
+except ModuleNotFoundError:
+    import mani_skill2.envs  # ManiSkill2
 import numpy as np
 from PIL import Image
 import torch

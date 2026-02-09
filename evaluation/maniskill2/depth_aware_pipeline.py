@@ -122,6 +122,11 @@ class DepthAwarePipeline:
             else:
                 depth_norm = np.zeros_like(depth_map, dtype=np.uint8)
 
+        # CLAHE: boost local contrast so subtle depth differences
+        # (e.g. cube vs table surface) become visible
+        clahe = cv2.createCLAHE(clipLimit=5.0, tileGridSize=(8, 8))
+        depth_norm = clahe.apply(depth_norm)
+
         # Apply INFERNO colormap (returns BGR) → convert to RGB
         depth_bgr = cv2.applyColorMap(depth_norm, self.colormap)
         depth_rgb = cv2.cvtColor(depth_bgr, cv2.COLOR_BGR2RGB)

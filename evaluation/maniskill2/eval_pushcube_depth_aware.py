@@ -41,9 +41,11 @@ DEFAULT_CONFIG = {
     "max_steps": 100,
     "unnorm_key": "libero_object_no_noops",
     "task_instruction": (
-        "Push the blue cube forward along the table toward the red and white "
-        "circular target. Approach the cube from behind and slide it forward "
-        "until it reaches the target zone."
+        "First, identify the blue cube and the red and white circular target. "
+        "Position the end-effector directly behind the center of the blue cube "
+        "to align with the target. Then, smoothly slide the cube forward in a "
+        "straight line until it is fully inside the target zone. Ensure the cube "
+        "remains flat on the table throughout the motion."
     ),
     "cfg_scale": 1.5,
     "use_ddim": True,

@@ -105,12 +105,18 @@ class DepthAwarePipeline:
         if depth_map.ndim == 3:
             depth_map = depth_map.squeeze(-1)
 
-        # Normalize to 0-255
-        d_min, d_max = depth_map.min(), depth_map.max()
-        if d_max - d_min > 1e-6:
-            depth_norm = ((depth_map - d_min) / (d_max - d_min) * 255).astype(np.uint8)
-        else:
+        # Clip to foreground range (exclude background/sky with extreme depth)
+        valid = depth_map[depth_map > 0]
+        if len(valid) == 0:
             depth_norm = np.zeros_like(depth_map, dtype=np.uint8)
+        else:
+            d_min = np.percentile(valid, 1)
+            d_max = np.percentile(valid, 99)
+            if d_max - d_min > 1e-6:
+                clipped = np.clip(depth_map, d_min, d_max)
+                depth_norm = ((clipped - d_min) / (d_max - d_min) * 255).astype(np.uint8)
+            else:
+                depth_norm = np.zeros_like(depth_map, dtype=np.uint8)
 
         # Apply INFERNO colormap (returns BGR) → convert to RGB
         depth_bgr = cv2.applyColorMap(depth_norm, self.colormap)

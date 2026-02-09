@@ -105,13 +105,17 @@ class DepthAwarePipeline:
         if depth_map.ndim == 3:
             depth_map = depth_map.squeeze(-1)
 
-        # Clip to foreground range (exclude background/sky with extreme depth)
-        valid = depth_map[depth_map > 0]
+        # Clip to foreground range (exclude background/sky)
+        # Background pixels can dominate even the 99th percentile,
+        # so we use median-based clipping: median is robust to background outliers
+        # since the table surface (foreground) occupies >50% of pixels.
+        valid = depth_map[(depth_map > 0) & np.isfinite(depth_map)]
         if len(valid) == 0:
             depth_norm = np.zeros_like(depth_map, dtype=np.uint8)
         else:
+            median = np.median(valid)
             d_min = np.percentile(valid, 1)
-            d_max = np.percentile(valid, 99)
+            d_max = median * 1.5  # Anything beyond 1.5x median is background
             if d_max - d_min > 1e-6:
                 clipped = np.clip(depth_map, d_min, d_max)
                 depth_norm = ((clipped - d_min) / (d_max - d_min) * 255).astype(np.uint8)

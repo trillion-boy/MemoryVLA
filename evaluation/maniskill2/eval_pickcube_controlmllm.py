@@ -69,7 +69,7 @@ def run_evaluation(
     verbose: bool = True,
     debug_masks: bool = True,
     # ControlMLLM parameters
-    T: int = 10,
+    T: int = 30,
     lr: float = 5.0,
     alpha_loss: float = 400.0,
     layer_start: int = 14,

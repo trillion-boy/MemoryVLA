@@ -69,15 +69,15 @@ def run_evaluation(
     verbose: bool = True,
     debug_masks: bool = True,
     # ControlMLLM parameters
-    T: int = 30,
+    T: int = 10,
     lr: float = 5.0,
     alpha_loss: float = 400.0,
     layer_start: int = 14,
     layer_end: int = 26,
-    optimize_freq: int = 1,
+    optimize_freq: int = 5,
     optimizer: str = "sgd",
     init_scale: float = 0.05,
-    sensor_resolution: int = 224,
+    sensor_resolution: int = 128,
 ) -> Dict[str, Any]:
     """
     Run PickCube evaluation with ControlMLLM visual prompt optimization.
@@ -177,6 +177,13 @@ def run_evaluation(
             frames.append(rgb.copy())
 
             episode_first = "True" if step == 0 else "False"
+
+            # Save full debug visualization for first frame of each trial
+            if step == 0:
+                frame_debug_path = os.path.join(
+                    save_dir, f"debug_first_frame_trial{trial}.png"
+                )
+                pipeline.debug_first_frame(pil_image, save_path=frame_debug_path)
 
             # Only save debug masks for first 5 steps of first trial
             step_debug_dir = None

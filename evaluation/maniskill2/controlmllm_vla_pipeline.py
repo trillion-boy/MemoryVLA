@@ -592,6 +592,9 @@ class ControlMLLMVLAPipeline:
         """
         self._step_count += 1
 
+        # Always pop debug_save_dir to prevent it leaking to model.generate()
+        debug_dir = kwargs.pop("debug_save_dir", None)
+
         # 1. Estimate depth
         depth_map = self.estimate_depth(image)
 
@@ -600,8 +603,6 @@ class ControlMLLMVLAPipeline:
                                        or self.optimize_freq == 1
                                        or self._visual_prompt is None):
             print(f"  [Step {self._step_count}] Optimizing visual prompt...")
-            # Save debug masks for first 3 steps
-            debug_dir = kwargs.pop("debug_save_dir", None)
             self._visual_prompt = self.optimize_visual_prompt(
                 image, instruction, depth_map,
                 debug_save_dir=debug_dir,

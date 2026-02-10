@@ -70,12 +70,13 @@ def run_evaluation(
     debug_masks: bool = True,
     # ControlMLLM parameters
     T: int = 10,
-    lr: float = 0.1,
+    lr: float = 1.0,
     alpha_loss: float = 400.0,
     layer_start: int = 14,
     layer_end: int = 26,
     optimize_freq: int = 1,
     optimizer: str = "sgd",
+    init_scale: float = 0.05,
     sensor_resolution: int = 128,
 ) -> Dict[str, Any]:
     """
@@ -118,6 +119,7 @@ def run_evaluation(
         layer_end=layer_end,
         optimize_freq=optimize_freq,
         optimizer=optimizer,
+        init_scale=init_scale,
     )
 
     depth_source = "Depth Anything V2" if depth_model else "None"

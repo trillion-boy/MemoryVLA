@@ -46,12 +46,13 @@ class ControlMLLMVLAPipeline:
         vla,
         depth_model=None,
         T: int = 10,
-        lr: float = 0.1,
+        lr: float = 1.0,
         alpha_loss: float = 400.0,
         layer_start: int = 14,
         layer_end: int = 26,
         optimize_freq: int = 1,
         optimizer: str = "sgd",
+        init_scale: float = 0.05,
     ):
         """
         Args:
@@ -74,6 +75,7 @@ class ControlMLLMVLAPipeline:
         self.layer_end = layer_end
         self.optimize_freq = optimize_freq
         self.optimizer = optimizer.lower()
+        self.init_scale = init_scale
 
         # Model references
         self.vlm = vla.vlm
@@ -410,9 +412,11 @@ class ControlMLLMVLAPipeline:
             with torch.no_grad():
                 depth_features = self.vlm.vision_backbone(depth_pixels)
                 depth_projected = self.vlm.projector(depth_features)
-            # Pv = depth_tokens (already at correct scale ~34 per token)
-            visual_prompt = depth_projected.float().detach().clone().requires_grad_(True)
-            init_source = "depth"
+            # Pv = scaled depth_tokens (perturbation, not full replacement)
+            # init_scale=0.05 → Pv starts at ~5% of base embedding norm
+            visual_prompt = (depth_projected.float().detach().clone() * self.init_scale
+                             ).requires_grad_(True)
+            init_source = f"depth×{self.init_scale}"
         else:
             visual_prompt = torch.zeros(
                 1, n_image_tokens, base_embeddings.shape[-1],

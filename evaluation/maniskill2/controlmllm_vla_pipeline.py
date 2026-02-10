@@ -171,28 +171,47 @@ class ControlMLLMVLAPipeline:
             all_blobs.append((i, area, touches_border))
 
         # Strategy: prefer small, non-border blobs (= cube)
-        # If none found, fall back to smallest blob overall
-        interior_blobs = [(i, a) for i, a, tb in all_blobs if not tb]
-        border_blobs = [(i, a) for i, a, tb in all_blobs if tb]
+        # Cube at 128x128 is roughly 8-15px wide → 64-225 pixels area
+        # At 16x16 grid that's ~2-6 patches
+        max_cube_area = total_pixels * 0.03  # max 3% of image (~500px at 128x128)
+
+        interior_blobs = [(i, a) for i, a, tb in all_blobs if not tb and a <= max_cube_area]
+        small_border = [(i, a) for i, a, tb in all_blobs if tb and a <= max_cube_area]
 
         cube_mask = np.zeros((img_h, img_w), dtype=np.float32)
 
         if interior_blobs:
             # Sort by area, pick smallest interior blob (most likely cube)
             interior_blobs.sort(key=lambda x: x[1])
-            for label_id, area in interior_blobs[:2]:
-                cube_mask[labels == label_id] = 1.0
-        elif border_blobs:
-            # All blobs touch border — pick the smallest one
-            border_blobs.sort(key=lambda x: x[1])
-            label_id, area = border_blobs[0]
+            label_id, area = interior_blobs[0]
             cube_mask[labels == label_id] = 1.0
+            # Dilate slightly to ensure coverage in 16x16 grid
+            dil_kernel = np.ones((3, 3), np.uint8)
+            cube_mask = cv2.dilate(cube_mask, dil_kernel, iterations=1)
+        elif small_border:
+            small_border.sort(key=lambda x: x[1])
+            label_id, area = small_border[0]
+            cube_mask[labels == label_id] = 1.0
+            dil_kernel = np.ones((3, 3), np.uint8)
+            cube_mask = cv2.dilate(cube_mask, dil_kernel, iterations=1)
         else:
-            # No blobs at all — create a small center-focused mask
-            # (reasonable prior: objects are usually near center)
-            cy, cx = img_h // 2, img_w // 2
-            r = max(img_h // 8, 4)
-            cube_mask[cy - r:cy + r, cx - r:cx + r] = 1.0
+            # Fallback: pick the blob closest to image center
+            # (cube is usually near center of workspace)
+            cy, cx = img_h / 2, img_w / 2
+            best_label, best_dist = None, float('inf')
+            for i, area, tb in all_blobs:
+                blob_cy, blob_cx = centroids[i]
+                dist = np.sqrt((blob_cy - cy)**2 + (blob_cx - cx)**2)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_label = i
+            if best_label is not None:
+                cube_mask[labels == best_label] = 1.0
+            else:
+                # Absolute fallback: small center region
+                r = max(img_h // 10, 3)
+                icy, icx = int(cy), int(cx)
+                cube_mask[icy - r:icy + r, icx - r:icx + r] = 1.0
 
         # --- Step 4: Max Pooling to 16x16 grid ---
         block_h = img_h // grid_h
@@ -246,27 +265,17 @@ class ControlMLLMVLAPipeline:
         image_end: int,
     ) -> torch.Tensor:
         """
-        ControlMLLM attention alignment loss.
+        Attention alignment loss with temperature scaling for stronger gradients.
 
-        Measures what fraction of the last token's attention falls
-        inside the mask region, and penalizes if it's low.
+        Post-softmax attention is very peaked (1-2 patches dominate), causing
+        vanishing gradients. We re-scale attention with temperature to soften
+        the distribution, making it easier for gradient to redistribute attention.
 
         Loss = alpha * (1 - activation_value)^2
-        where activation_value = sum(attention * mask) / sum(attention)
-
-        Args:
-            attentions: Tuple of attention tensors per layer
-                        Each: [batch, heads, seq_len, seq_len]
-            mask: Spatial mask [1, N_spatial_patches]
-            image_start: Start index of image tokens
-            image_end: End index of image tokens
-
-        Returns:
-            loss: scalar tensor
+        where activation_value = sum(softmax(attn/T) * mask)
         """
         device = mask.device
 
-        # Select middle-to-late layers (ControlMLLM uses layers 14-26)
         end = min(self.layer_end, len(attentions))
         start = min(self.layer_start, end)
 
@@ -286,21 +295,24 @@ class ControlMLLMVLAPipeline:
         # Attention from last token to image tokens: [batch, N_patches]
         last_to_image = mean_attn[:, -1, image_start:image_end]
 
-        # Handle CLS token: mask is [1, 256] but image tokens might be 257
+        # Handle CLS token
         n_image = image_end - image_start
         if mask.shape[1] < n_image:
-            # Pad mask with 0 for CLS token (position 0 of image tokens)
             pad = torch.zeros(1, n_image - mask.shape[1], device=device)
-            mask_padded = torch.cat([pad, mask], dim=1)  # CLS first, then spatial
+            mask_padded = torch.cat([pad, mask], dim=1)
         else:
             mask_padded = mask[:, :n_image]
 
-        # Normalize attention
-        attn_sum = last_to_image.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-        last_to_image_norm = last_to_image / attn_sum
+        # Temperature-scaled re-normalization for stronger gradients
+        # Post-softmax attention is too peaked → gradient vanishes
+        # Re-apply softmax with high temperature to soften the distribution
+        # This preserves the gradient graph while making optimization easier
+        temperature = 5.0
+        log_attn = torch.log(last_to_image.clamp(min=1e-10))
+        attn_rescaled = torch.softmax(log_attn / temperature, dim=-1)
 
-        # Activation: fraction of attention inside mask
-        activation = (last_to_image_norm * mask_padded).sum(dim=-1)
+        # Activation: fraction of rescaled attention inside mask
+        activation = (attn_rescaled * mask_padded).sum(dim=-1)
 
         # Loss: push activation toward 1.0
         loss = self.alpha_loss * ((1.0 - activation) ** 2).mean()
@@ -458,6 +470,7 @@ class ControlMLLMVLAPipeline:
 
             # Backprop
             grad = torch.autograd.grad(loss, visual_prompt)[0]
+            grad_norm = grad.norm().item()
 
             if self.optimizer == "adam":
                 # Adam update
@@ -475,7 +488,9 @@ class ControlMLLMVLAPipeline:
                 ).detach().requires_grad_(True)
 
             if t == 1 or t == self.T or t % 5 == 0:
-                print(f"    [Optim step {t}/{self.T}] loss={loss.item():.4f}")
+                pv_norm = visual_prompt.norm().item()
+                print(f"    [Optim step {t}/{self.T}] loss={loss.item():.4f} "
+                      f"grad_norm={grad_norm:.6f} pv_norm={pv_norm:.4f}")
 
         return visual_prompt.detach().to(model_dtype)
 

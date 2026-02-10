@@ -46,7 +46,7 @@ class ControlMLLMVLAPipeline:
         vla,
         depth_model=None,
         T: int = 10,
-        lr: float = 0.1,
+        lr: float = 1.0,
         alpha_loss: float = 400.0,
         layer_start: int = 14,
         layer_end: int = 26,
@@ -380,6 +380,11 @@ class ControlMLLMVLAPipeline:
         image_start = 1
         image_end = 1 + n_image_tokens
 
+        # Log base embedding scale for diagnosing LR
+        base_img = base_embeddings[:, image_start:image_end, :]
+        per_token_norm = base_img.float().norm(dim=-1).mean().item()
+        print(f"    Base embedding per-token norm: {per_token_norm:.2f}")
+
         # 3. Initialize Pv = zeros (ControlMLLM style)
         visual_prompt = torch.zeros(
             1, n_image_tokens, base_embeddings.shape[-1],
@@ -431,9 +436,11 @@ class ControlMLLMVLAPipeline:
                 ).detach().requires_grad_(True)
 
             if t == 1 or t == self.T or t % 5 == 0:
-                pv_norm = visual_prompt.norm().item()
+                pv_per_token = visual_prompt.float().norm(dim=-1).mean().item()
+                ratio = pv_per_token / max(per_token_norm, 1e-6) * 100
                 print(f"    [Optim step {t}/{self.T}] loss={loss.item():.4f} "
-                      f"grad_norm={grad_norm:.6f} pv_norm={pv_norm:.4f}")
+                      f"grad_norm={grad_norm:.6f} "
+                      f"pv/token={pv_per_token:.4f} ({ratio:.2f}% of base)")
 
         return visual_prompt.detach().to(model_dtype)
 

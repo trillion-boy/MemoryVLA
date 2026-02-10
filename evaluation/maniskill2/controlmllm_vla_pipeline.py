@@ -111,90 +111,105 @@ class ControlMLLMVLAPipeline:
         rgb_image: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         """
-        Create attention mask from depth map using depth peak detection.
+        Create attention mask using RGB color saliency.
 
-        Strategy (simpler, more robust than CCA):
-            1. Compute depth at 16x16 grid level directly
-            2. Find patches with depth significantly different from table
-            3. Among those, pick the most "peaky" small cluster
-               (cube = isolated depth peak on flat table)
+        Depth CANNOT distinguish cube from table (cube sits ON table,
+        nearly identical depth). Instead, use RGB color:
+        - Cube has a distinctive saturated color (red/green/blue)
+        - Table is brown/gray, robot arm is gray/silver
+        - Find the most color-distinct small region = cube
 
-        The key insight: work at 16x16 grid resolution from the start,
-        avoiding pixel-level noise at 128x128.
+        Strategy:
+            1. Convert to HSV, compute per-patch color statistics
+            2. Find patches with high saturation (vivid color = cube)
+            3. Filter: small cluster, not at edges
+            4. Fallback: most color-distinct patches from background
 
         Args:
-            depth_map: Depth values (H, W) from DA V2
+            depth_map: Depth values (unused, kept for API compat)
             grid_h, grid_w: Attention grid size (16x16 for 256 patches)
-            debug_save_path: If set, save mask visualization for debugging
-            rgb_image: Optional RGB image for debug visualization
+            debug_save_path: If set, save visualization
+            rgb_image: RGB image (REQUIRED for color-based detection)
 
         Returns:
             mask: Tensor [1, grid_h * grid_w] (normalized)
         """
-        d = depth_map.copy().astype(np.float32)
-        img_h, img_w = d.shape
+        if rgb_image is None:
+            # Fallback: uniform mask if no RGB
+            mask_tensor = torch.ones(grid_h * grid_w) / (grid_h * grid_w)
+            return mask_tensor.unsqueeze(0)
 
-        # --- Step 1: Compute grid-level depth statistics ---
+        img_h, img_w = rgb_image.shape[:2]
         block_h = img_h // grid_h
         block_w = img_w // grid_w
-        grid_depth = np.zeros((grid_h, grid_w), dtype=np.float32)
-        grid_std = np.zeros((grid_h, grid_w), dtype=np.float32)
+
+        # --- Step 1: Convert to HSV for color analysis ---
+        hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
+
+        # Compute per-grid-cell statistics
+        grid_sat = np.zeros((grid_h, grid_w), dtype=np.float32)   # mean saturation
+        grid_hue = np.zeros((grid_h, grid_w), dtype=np.float32)   # mean hue
+        grid_rgb = np.zeros((grid_h, grid_w, 3), dtype=np.float32)  # mean RGB
 
         for i in range(grid_h):
             for j in range(grid_w):
-                block = d[i * block_h:(i + 1) * block_h,
-                          j * block_w:(j + 1) * block_w]
-                grid_depth[i, j] = np.mean(block)
-                grid_std[i, j] = np.std(block)
+                block_hsv = hsv[i * block_h:(i + 1) * block_h,
+                                j * block_w:(j + 1) * block_w]
+                block_rgb = rgb_image[i * block_h:(i + 1) * block_h,
+                                      j * block_w:(j + 1) * block_w]
+                grid_sat[i, j] = np.mean(block_hsv[:, :, 1])  # saturation channel
+                grid_hue[i, j] = np.mean(block_hsv[:, :, 0])  # hue channel
+                grid_rgb[i, j] = np.mean(block_rgb.reshape(-1, 3), axis=0)
 
-        # --- Step 2: Find table surface (dominant depth) ---
-        # Table is the largest flat area → mode of grid depths
-        table_depth = np.median(grid_depth)
+        # --- Step 2: Find color-distinct patches ---
+        # Background color = median RGB (table is the dominant surface)
+        bg_color = np.median(grid_rgb.reshape(-1, 3), axis=0)
 
-        # Deviation from table: how different is each patch
-        deviation = np.abs(grid_depth - table_depth)
-        dev_threshold = np.percentile(deviation, 75)  # top 25% most different
+        # Color distance from background for each patch
+        color_dist = np.sqrt(np.sum((grid_rgb - bg_color) ** 2, axis=-1))
 
-        # --- Step 3: Identify object patches ---
-        # Object patches = significantly different from table + high local variation
-        object_patches = (deviation > dev_threshold).astype(np.float32)
+        # Saturation score: cube is vivid, table/arm are desaturated
+        # Combine: high saturation AND different color from background
+        saliency = grid_sat * color_dist
+        saliency = saliency / (saliency.max() + 1e-8)
 
-        # --- Step 4: Filter to find cube (smallest cluster, away from edges) ---
-        # Remove edge patches (robot arm typically at edges)
-        edge_mask = np.ones((grid_h, grid_w), dtype=np.float32)
-        edge_mask[0, :] = 0  # top row
-        edge_mask[-1, :] = 0  # bottom row
-        edge_mask[:, 0] = 0  # left col
-        edge_mask[:, -1] = 0  # right col
+        # --- Step 3: Threshold and find cube cluster ---
+        # Cube should be in the top saliency patches
+        sal_threshold = np.percentile(saliency, 85)  # top 15%
+        salient_patches = (saliency > sal_threshold).astype(np.uint8)
 
-        interior_objects = object_patches * edge_mask
+        # Remove edge rows/cols (robot arm)
+        edge_mask = np.ones((grid_h, grid_w), dtype=np.uint8)
+        edge_mask[0, :] = 0
+        edge_mask[-1, :] = 0
+        edge_mask[:, 0] = 0
+        edge_mask[:, -1] = 0
+        salient_interior = salient_patches * edge_mask
 
-        # CCA on the 16x16 grid (much simpler than on 128x128!)
-        interior_uint8 = interior_objects.astype(np.uint8)
+        # CCA on 16x16 to find smallest cluster (= cube)
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            interior_uint8, connectivity=4
+            salient_interior, connectivity=4
         )
 
-        # Pick the smallest non-trivial cluster
         best_label = None
         best_area = float('inf')
         for i in range(1, num_labels):
             area = stats[i, cv2.CC_STAT_AREA]
-            if 1 <= area <= 12 and area < best_area:  # 1-12 patches (cube-sized)
+            if 1 <= area <= 8 and area < best_area:
                 best_area = area
                 best_label = i
 
         if best_label is not None:
             mask_grid = (labels == best_label).astype(np.float32)
-            # Dilate by 1 patch for margin
+            # Dilate by 1 for margin
             dil_kernel = np.ones((3, 3), np.uint8)
             mask_grid = cv2.dilate(mask_grid, dil_kernel, iterations=1)
-        elif interior_objects.sum() > 0 and interior_objects.sum() <= 20:
-            # Use all interior object patches if few enough
-            mask_grid = interior_objects
+        elif salient_interior.sum() > 0:
+            # Use all salient interior patches
+            mask_grid = salient_interior.astype(np.float32)
         else:
-            # Fallback: top-4 most deviant interior patches
-            flat = (deviation * edge_mask).flatten()
+            # Fallback: top-4 most salient interior patches
+            flat = (saliency * edge_mask).flatten()
             topk_idx = np.argsort(flat)[-4:]
             mask_grid = np.zeros(grid_h * grid_w, dtype=np.float32)
             mask_grid[topk_idx] = 1.0
@@ -202,24 +217,17 @@ class ControlMLLMVLAPipeline:
 
         # --- Debug visualization ---
         if debug_save_path:
-            n_panels = 5 if rgb_image is not None else 4
-            fig, axes = plt.subplots(1, n_panels, figsize=(n_panels * 4, 4))
-            idx = 0
-            if rgb_image is not None:
-                axes[idx].imshow(rgb_image)
-                axes[idx].set_title("RGB input")
-                idx += 1
-            axes[idx].imshow(grid_depth, cmap="viridis", interpolation="nearest")
-            axes[idx].set_title("16x16 grid depth")
-            idx += 1
-            axes[idx].imshow(deviation, cmap="hot", interpolation="nearest")
-            axes[idx].set_title(f"Deviation from table\nthr={dev_threshold:.3f}")
-            idx += 1
-            axes[idx].imshow(interior_objects, cmap="gray", interpolation="nearest")
-            axes[idx].set_title(f"Interior objects\n{int(interior_objects.sum())} patches")
-            idx += 1
-            axes[idx].imshow(mask_grid, cmap="hot", interpolation="nearest")
-            axes[idx].set_title(f"Final mask\n{int(mask_grid.sum())} patches")
+            fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+            axes[0].imshow(rgb_image)
+            axes[0].set_title("RGB input")
+            axes[1].imshow(grid_sat, cmap="hot", interpolation="nearest")
+            axes[1].set_title("Saturation (per patch)")
+            axes[2].imshow(color_dist, cmap="hot", interpolation="nearest")
+            axes[2].set_title(f"Color dist from bg")
+            axes[3].imshow(saliency, cmap="hot", interpolation="nearest")
+            axes[3].set_title(f"Saliency (sat * dist)")
+            axes[4].imshow(mask_grid, cmap="hot", interpolation="nearest")
+            axes[4].set_title(f"Final mask\n{int(mask_grid.sum())} patches")
             for ax in axes:
                 ax.axis("off")
             plt.tight_layout()
@@ -405,10 +413,10 @@ class ControlMLLMVLAPipeline:
             mask_debug_path = os.path.join(
                 debug_save_dir, f"mask_step_{self._step_count:03d}.png"
             )
-        rgb_for_debug = np.array(image) if mask_debug_path else None
+        rgb_np = np.array(image)
         mask = self.create_spatial_mask(
             depth_map, debug_save_path=mask_debug_path,
-            rgb_image=rgb_for_debug,
+            rgb_image=rgb_np,
         )  # [1, 256]
         mask = mask.to(device)
 
@@ -565,11 +573,10 @@ class ControlMLLMVLAPipeline:
         Call this to see what the model sees and what the mask looks like.
         """
         rgb = np.array(image)
+        # Depth is optional now (mask uses RGB color saliency)
         depth = self.estimate_depth(image)
-
         if depth is None:
-            print("No depth model available")
-            return
+            depth = np.zeros(rgb.shape[:2], dtype=np.float32)
 
         # Create mask with debug
         self.create_spatial_mask(

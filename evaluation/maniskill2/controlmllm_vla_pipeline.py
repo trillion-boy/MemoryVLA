@@ -111,31 +111,26 @@ class ControlMLLMVLAPipeline:
         rgb_image: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         """
-        Create attention mask using RGB color saliency.
+        Create attention mask using HSV saturation peak detection.
 
-        Depth CANNOT distinguish cube from table (cube sits ON table,
-        nearly identical depth). Instead, use RGB color:
-        - Cube has a distinctive saturated color (red/green/blue)
-        - Table is brown/gray, robot arm is gray/silver
-        - Find the most color-distinct small region = cube
+        The cube is the MOST SATURATED object in the scene:
+        - Cube: vivid red/green/blue (high saturation)
+        - Table: brown wood (moderate saturation)
+        - Robot arm: gray/silver (low saturation)
+        - Background sky: gray (low saturation)
 
-        Strategy:
-            1. Convert to HSV, compute per-patch color statistics
-            2. Find patches with high saturation (vivid color = cube)
-            3. Filter: small cluster, not at edges
-            4. Fallback: most color-distinct patches from background
+        Simply take the top-K most saturated patches = cube location.
 
         Args:
             depth_map: Depth values (unused, kept for API compat)
             grid_h, grid_w: Attention grid size (16x16 for 256 patches)
             debug_save_path: If set, save visualization
-            rgb_image: RGB image (REQUIRED for color-based detection)
+            rgb_image: RGB image (REQUIRED)
 
         Returns:
             mask: Tensor [1, grid_h * grid_w] (normalized)
         """
         if rgb_image is None:
-            # Fallback: uniform mask if no RGB
             mask_tensor = torch.ones(grid_h * grid_w) / (grid_h * grid_w)
             return mask_tensor.unsqueeze(0)
 
@@ -143,91 +138,47 @@ class ControlMLLMVLAPipeline:
         block_h = img_h // grid_h
         block_w = img_w // grid_w
 
-        # --- Step 1: Convert to HSV for color analysis ---
+        # --- Step 1: Compute per-patch saturation ---
         hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
-
-        # Compute per-grid-cell statistics
-        grid_sat = np.zeros((grid_h, grid_w), dtype=np.float32)   # mean saturation
-        grid_hue = np.zeros((grid_h, grid_w), dtype=np.float32)   # mean hue
-        grid_rgb = np.zeros((grid_h, grid_w, 3), dtype=np.float32)  # mean RGB
+        grid_sat = np.zeros((grid_h, grid_w), dtype=np.float32)
 
         for i in range(grid_h):
             for j in range(grid_w):
-                block_hsv = hsv[i * block_h:(i + 1) * block_h,
-                                j * block_w:(j + 1) * block_w]
-                block_rgb = rgb_image[i * block_h:(i + 1) * block_h,
-                                      j * block_w:(j + 1) * block_w]
-                grid_sat[i, j] = np.mean(block_hsv[:, :, 1])  # saturation channel
-                grid_hue[i, j] = np.mean(block_hsv[:, :, 0])  # hue channel
-                grid_rgb[i, j] = np.mean(block_rgb.reshape(-1, 3), axis=0)
+                block = hsv[i * block_h:(i + 1) * block_h,
+                            j * block_w:(j + 1) * block_w, 1]
+                grid_sat[i, j] = np.mean(block)
 
-        # --- Step 2: Find color-distinct patches ---
-        # Background color = median RGB (table is the dominant surface)
-        bg_color = np.median(grid_rgb.reshape(-1, 3), axis=0)
+        # --- Step 2: Find peak saturation patches ---
+        # The cube is the most saturated → take top patches
+        flat_sat = grid_sat.flatten()
+        # Use a high threshold: only the very peak
+        peak_threshold = np.percentile(flat_sat, 95)  # top 5%
+        peak_patches = (grid_sat >= peak_threshold).astype(np.float32)
 
-        # Color distance from background for each patch
-        color_dist = np.sqrt(np.sum((grid_rgb - bg_color) ** 2, axis=-1))
+        # If too many patches pass (>8), tighten to top-4
+        if peak_patches.sum() > 8:
+            topk_idx = np.argsort(flat_sat)[-4:]
+            peak_patches = np.zeros_like(flat_sat)
+            peak_patches[topk_idx] = 1.0
+            peak_patches = peak_patches.reshape(grid_h, grid_w)
 
-        # Saturation score: cube is vivid, table/arm are desaturated
-        # Combine: high saturation AND different color from background
-        saliency = grid_sat * color_dist
-        saliency = saliency / (saliency.max() + 1e-8)
-
-        # --- Step 3: Threshold and find cube cluster ---
-        # Cube should be in the top saliency patches
-        sal_threshold = np.percentile(saliency, 85)  # top 15%
-        salient_patches = (saliency > sal_threshold).astype(np.uint8)
-
-        # Remove edge rows/cols (robot arm)
-        edge_mask = np.ones((grid_h, grid_w), dtype=np.uint8)
-        edge_mask[0, :] = 0
-        edge_mask[-1, :] = 0
-        edge_mask[:, 0] = 0
-        edge_mask[:, -1] = 0
-        salient_interior = salient_patches * edge_mask
-
-        # CCA on 16x16 to find smallest cluster (= cube)
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            salient_interior, connectivity=4
-        )
-
-        best_label = None
-        best_area = float('inf')
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if 1 <= area <= 8 and area < best_area:
-                best_area = area
-                best_label = i
-
-        if best_label is not None:
-            mask_grid = (labels == best_label).astype(np.float32)
-            # Dilate by 1 for margin
-            dil_kernel = np.ones((3, 3), np.uint8)
-            mask_grid = cv2.dilate(mask_grid, dil_kernel, iterations=1)
-        elif salient_interior.sum() > 0:
-            # Use all salient interior patches
-            mask_grid = salient_interior.astype(np.float32)
-        else:
-            # Fallback: top-4 most salient interior patches
-            flat = (saliency * edge_mask).flatten()
-            topk_idx = np.argsort(flat)[-4:]
-            mask_grid = np.zeros(grid_h * grid_w, dtype=np.float32)
-            mask_grid[topk_idx] = 1.0
-            mask_grid = mask_grid.reshape(grid_h, grid_w)
+        # Dilate by 1 patch for margin
+        peak_uint8 = peak_patches.astype(np.uint8)
+        dil_kernel = np.ones((3, 3), np.uint8)
+        mask_grid = cv2.dilate(peak_uint8, dil_kernel, iterations=1).astype(np.float32)
 
         # --- Debug visualization ---
         if debug_save_path:
-            fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
             axes[0].imshow(rgb_image)
             axes[0].set_title("RGB input")
             axes[1].imshow(grid_sat, cmap="hot", interpolation="nearest")
-            axes[1].set_title("Saturation (per patch)")
-            axes[2].imshow(color_dist, cmap="hot", interpolation="nearest")
-            axes[2].set_title(f"Color dist from bg")
-            axes[3].imshow(saliency, cmap="hot", interpolation="nearest")
-            axes[3].set_title(f"Saliency (sat * dist)")
-            axes[4].imshow(mask_grid, cmap="hot", interpolation="nearest")
-            axes[4].set_title(f"Final mask\n{int(mask_grid.sum())} patches")
+            axes[1].set_title(f"Saturation (per patch)\nmax={grid_sat.max():.1f}")
+            axes[2].imshow(peak_patches.reshape(grid_h, grid_w), cmap="gray",
+                          interpolation="nearest")
+            axes[2].set_title(f"Peak sat patches\nthr={peak_threshold:.1f}")
+            axes[3].imshow(mask_grid, cmap="hot", interpolation="nearest")
+            axes[3].set_title(f"Final mask (dilated)\n{int(mask_grid.sum())} patches")
             for ax in axes:
                 ax.axis("off")
             plt.tight_layout()

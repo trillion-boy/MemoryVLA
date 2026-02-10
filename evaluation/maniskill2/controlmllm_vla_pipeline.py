@@ -46,7 +46,7 @@ class ControlMLLMVLAPipeline:
         vla,
         depth_model=None,
         T: int = 10,
-        lr: float = 5.0,
+        lr: float = 0.1,
         alpha_loss: float = 400.0,
         layer_start: int = 14,
         layer_end: int = 26,
@@ -385,11 +385,44 @@ class ControlMLLMVLAPipeline:
         per_token_norm = base_img.float().norm(dim=-1).mean().item()
         print(f"    Base embedding per-token norm: {per_token_norm:.2f}")
 
-        # 3. Initialize Pv = zeros (ControlMLLM style)
-        visual_prompt = torch.zeros(
-            1, n_image_tokens, base_embeddings.shape[-1],
-            device=device, dtype=torch.float32,
-        ).requires_grad_(True)
+        # 3. Initialize Pv from depth map (ControlMLLM style: control image → visual features)
+        # Pass depth map through same vision backbone + projector to get
+        # features in the same embedding space, then use as Pv initialization.
+        if depth_map is not None:
+            # Convert depth to 3-channel PIL image for vision backbone
+            depth_norm = depth_map.astype(np.float32)
+            d_min, d_max = depth_norm.min(), depth_norm.max()
+            if d_max - d_min > 1e-6:
+                depth_norm = (depth_norm - d_min) / (d_max - d_min)
+            depth_uint8 = (depth_norm * 255).astype(np.uint8)
+            depth_rgb = np.stack([depth_uint8] * 3, axis=-1)
+            depth_pil = Image.fromarray(depth_rgb)
+
+            # Process through same vision backbone + projector
+            depth_pixels = self.image_transform(depth_pil)
+            if isinstance(depth_pixels, torch.Tensor):
+                depth_pixels = depth_pixels[None, ...].to(device, dtype=model_dtype)
+            elif isinstance(depth_pixels, dict):
+                depth_pixels = {
+                    k: v[None, ...].to(device, dtype=model_dtype)
+                    for k, v in depth_pixels.items()
+                }
+            with torch.no_grad():
+                depth_features = self.vlm.vision_backbone(depth_pixels)
+                depth_projected = self.vlm.projector(depth_features)
+            # Pv = depth_tokens (already at correct scale ~34 per token)
+            visual_prompt = depth_projected.float().detach().clone().requires_grad_(True)
+            init_source = "depth"
+        else:
+            visual_prompt = torch.zeros(
+                1, n_image_tokens, base_embeddings.shape[-1],
+                device=device, dtype=torch.float32,
+            ).requires_grad_(True)
+            init_source = "zeros"
+
+        pv_init_norm = visual_prompt.float().norm(dim=-1).mean().item()
+        print(f"    Pv init ({init_source}): per-token norm={pv_init_norm:.2f} "
+              f"({pv_init_norm / max(per_token_norm, 1e-6) * 100:.1f}% of base)")
 
         # Optimizer state (Adam only, SGD needs no state)
         if self.optimizer == "adam":

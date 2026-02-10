@@ -9,7 +9,13 @@ Usage (Colab):
     depth_model = load_depth_anything_v2("Small")
 
     from evaluation.maniskill2.eval_pickcube_controlmllm import run_evaluation
-    results = run_evaluation(vla, depth_model=depth_model, num_trials=8)
+    results = run_evaluation(vla, depth_model=depth_model, num_trials=4)
+
+    # Attention diagnosis (run FIRST to find the right layers):
+    from evaluation.maniskill2.controlmllm_vla_pipeline import ControlMLLMVLAPipeline
+    pipeline = ControlMLLMVLAPipeline(vla, depth_model=depth_model)
+    # Get one observation from env, then:
+    pipeline.visualize_attention_by_layer(pil_image, instruction)
 """
 
 import gymnasium as gym
@@ -53,7 +59,7 @@ def get_rgb_from_obs(obs):
 def run_evaluation(
     vla,
     depth_model=None,
-    num_trials: int = 8,
+    num_trials: int = 4,
     max_steps: int = 100,
     task_instruction: str = TASK_INSTRUCTION,
     unnorm_key: str = "libero_object_no_noops",
@@ -61,13 +67,16 @@ def run_evaluation(
     cfg_scale: float = 1.5,
     save_videos: bool = True,
     verbose: bool = True,
+    debug_masks: bool = True,
     # ControlMLLM parameters
-    T: int = 5,
-    lr: float = 0.03,
+    T: int = 10,
+    lr: float = 0.1,
     alpha_loss: float = 400.0,
     layer_start: int = 14,
     layer_end: int = 26,
     optimize_freq: int = 1,
+    optimizer: str = "sgd",
+    sensor_resolution: int = 128,
 ) -> Dict[str, Any]:
     """
     Run PickCube evaluation with ControlMLLM visual prompt optimization.
@@ -83,12 +92,15 @@ def run_evaluation(
         cfg_scale: CFG scale
         save_videos: Save episode videos
         verbose: Print progress
+        debug_masks: Save mask debug images for first trial
         T: Optimization iterations per step
         lr: Learning rate for visual prompt
         alpha_loss: Loss scaling factor
         layer_start: First LLM layer for attention
         layer_end: Last LLM layer for attention
         optimize_freq: Optimize every N steps
+        optimizer: "adam" or "sgd"
+        sensor_resolution: Camera resolution (128 or 256)
 
     Returns:
         Dictionary with results
@@ -105,6 +117,7 @@ def run_evaluation(
         layer_start=layer_start,
         layer_end=layer_end,
         optimize_freq=optimize_freq,
+        optimizer=optimizer,
     )
 
     depth_source = "Depth Anything V2" if depth_model else "None"
@@ -117,6 +130,9 @@ def run_evaluation(
         num_envs=1,
         render_mode="rgb_array",
         max_episode_steps=max_steps,
+        sensor_configs=dict(
+            base_camera=dict(width=sensor_resolution, height=sensor_resolution),
+        ),
     )
 
     if verbose:
@@ -126,12 +142,14 @@ def run_evaluation(
         print(f"Task: {task_instruction}")
         print(f"Trials: {num_trials}, Max steps: {max_steps}")
         print(f"Depth source: {depth_source}")
+        print(f"Resolution: {sensor_resolution}x{sensor_resolution}")
         print(f"{'='*60}")
         print(f"ControlMLLM Config:")
         print(f"  T (iterations):    {T}")
         print(f"  lr:                {lr}")
         print(f"  alpha_loss:        {alpha_loss}")
         print(f"  Layers:            {layer_start}-{layer_end}")
+        print(f"  Optimizer:         {optimizer}")
         print(f"  Optimize freq:     every {optimize_freq} step(s)")
         print(f"{'='*60}\n")
 
@@ -146,12 +164,22 @@ def run_evaluation(
         terminated = False
         truncated = False
 
+        # Debug mask dir for first trial only
+        trial_debug_dir = None
+        if debug_masks and trial == 0:
+            trial_debug_dir = os.path.join(save_dir, "debug_masks_trial0")
+
         for step in range(max_steps):
             rgb = get_rgb_from_obs(obs)
             pil_image = Image.fromarray(rgb)
             frames.append(rgb.copy())
 
             episode_first = "True" if step == 0 else "False"
+
+            # Only save debug masks for first 5 steps of first trial
+            step_debug_dir = None
+            if trial_debug_dir and step < 5:
+                step_debug_dir = trial_debug_dir
 
             actions, _ = pipeline.predict_action(
                 image=pil_image,
@@ -162,6 +190,7 @@ def run_evaluation(
                 use_ddim=True,
                 num_ddim_steps=10,
                 episode_first_frame=episode_first,
+                debug_save_dir=step_debug_dir,
             )
 
             action = actions[0]
@@ -223,10 +252,14 @@ def run_evaluation(
         "env_name": "PickCube-v1",
         "pipeline": "ControlMLLM-VLA",
         "depth_source": depth_source,
+        "optimizer": optimizer,
         "T": T,
         "lr": lr,
         "alpha_loss": alpha_loss,
+        "layer_start": layer_start,
+        "layer_end": layer_end,
         "optimize_freq": optimize_freq,
+        "sensor_resolution": sensor_resolution,
         "num_trials": num_trials,
         "success_count": total_success,
         "success_rate": 100 * total_success / num_trials,
@@ -242,6 +275,7 @@ def run_evaluation(
         print(f"Success Rate: {total_success}/{num_trials} ({summary['success_rate']:.1f}%)")
         print(f"Avg Reward:   {avg_reward:.3f}")
         print(f"Avg Steps:    {avg_steps:.1f}")
+        print(f"Config: T={T}, lr={lr}, optim={optimizer}, layers={layer_start}-{layer_end}")
         print(f"{'='*60}")
 
     # Save results
@@ -249,9 +283,10 @@ def run_evaluation(
     with open(result_file, "w") as f:
         f.write(f"PickCube ControlMLLM-VLA Results - {datetime.now()}\n")
         f.write(f"{'='*60}\n")
-        f.write(f"Config: T={T}, lr={lr}, alpha={alpha_loss}, "
+        f.write(f"Config: T={T}, lr={lr}, optim={optimizer}, alpha={alpha_loss}, "
                 f"layers={layer_start}-{layer_end}, freq={optimize_freq}\n")
-        f.write(f"Depth: {depth_source}\n\n")
+        f.write(f"Depth: {depth_source}\n")
+        f.write(f"Resolution: {sensor_resolution}x{sensor_resolution}\n\n")
         f.write(f"Success: {total_success}/{num_trials} ({summary['success_rate']:.1f}%)\n")
         f.write(f"Avg Reward: {avg_reward:.3f}\n\n")
         for r in results:

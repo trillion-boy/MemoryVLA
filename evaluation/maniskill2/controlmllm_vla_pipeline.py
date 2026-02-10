@@ -15,7 +15,7 @@ Pipeline:
         - Add Pv to image token embeddings
         - Forward through frozen LLM → extract attention maps
         - Loss = alpha * (1 - attention_inside_mask)^2
-        - Update Pv via Adam
+        - Update Pv via Adam or SGD
     4. Inject optimized Pv into MemoryVLA's predict_action via hook
 
 Reference: ControlMLLM (NeurIPS 2024) - https://github.com/mrwu-mac/ControlMLLM
@@ -24,9 +24,13 @@ Reference: ControlMLLM (NeurIPS 2024) - https://github.com/mrwu-mac/ControlMLLM
 import cv2
 import numpy as np
 import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 from PIL import Image
 from typing import Optional, Tuple, Any
 from transformers import LlamaTokenizerFast
+import os
 
 
 class ControlMLLMVLAPipeline:
@@ -41,12 +45,13 @@ class ControlMLLMVLAPipeline:
         self,
         vla,
         depth_model=None,
-        T: int = 5,
-        lr: float = 0.03,
+        T: int = 10,
+        lr: float = 0.1,
         alpha_loss: float = 400.0,
         layer_start: int = 14,
         layer_end: int = 26,
         optimize_freq: int = 1,
+        optimizer: str = "sgd",
     ):
         """
         Args:
@@ -58,6 +63,7 @@ class ControlMLLMVLAPipeline:
             layer_start: First LLM layer for attention extraction
             layer_end: Last LLM layer for attention extraction
             optimize_freq: Optimize every N steps (1=every step, 5=every 5th step)
+            optimizer: "adam" or "sgd" (sgd is better for short T)
         """
         self.vla = vla
         self.depth_model = depth_model
@@ -67,6 +73,7 @@ class ControlMLLMVLAPipeline:
         self.layer_start = layer_start
         self.layer_end = layer_end
         self.optimize_freq = optimize_freq
+        self.optimizer = optimizer.lower()
 
         # Model references
         self.vlm = vla.vlm
@@ -99,21 +106,28 @@ class ControlMLLMVLAPipeline:
         return None
 
     def create_spatial_mask(
-        self, depth_map: np.ndarray, grid_h: int = 16, grid_w: int = 16
+        self, depth_map: np.ndarray, grid_h: int = 16, grid_w: int = 16,
+        debug_save_path: Optional[str] = None,
     ) -> torch.Tensor:
         """
-        Create attention mask from depth map.
+        Create attention mask from depth map, targeting ONLY the small
+        manipulation object (cube) and filtering out the robot arm.
 
-        Identifies object regions via depth edges and deviation from
-        the median (table surface). Returns a soft mask for the
-        attention alignment loss.
+        Strategy:
+            1. Find regions different from the table (median depth)
+            2. Connected Components Analysis (CCA) to separate blobs
+            3. Filter: keep only the SMALLEST isolated blob (= cube)
+               - Remove large blobs (robot arm)
+               - Remove border-connected blobs (robot arm enters from edge)
+            4. Max Pooling to 16x16 grid (preserves small objects)
 
         Args:
             depth_map: Depth values (H, W) from DA V2
             grid_h, grid_w: Attention grid size (16x16 for 256 patches)
+            debug_save_path: If set, save mask visualization for debugging
 
         Returns:
-            mask: Tensor [1, grid_h * grid_w] (normalized soft mask)
+            mask: Tensor [1, grid_h * grid_w] (normalized)
         """
         d = depth_map.copy().astype(np.float32)
         d_min, d_max = d.min(), d.max()
@@ -122,30 +136,97 @@ class ControlMLLMVLAPipeline:
         else:
             d_norm = np.zeros_like(d)
 
-        d_uint8 = (d_norm * 255).astype(np.uint8)
+        img_h, img_w = d_norm.shape
 
-        # Edge detection → object boundaries
-        edges = cv2.Canny(d_uint8, 30, 100)
-        kernel = np.ones((5, 5), np.uint8)
-        edges_dilated = cv2.dilate(edges, kernel, iterations=2)
-
-        # Regions significantly different from median (objects on table)
+        # --- Step 1: Find non-table regions ---
         median_depth = np.median(d_norm)
-        object_mask = (np.abs(d_norm - median_depth) > 0.08).astype(np.float32)
+        object_mask = (np.abs(d_norm - median_depth) > 0.06).astype(np.uint8)
 
-        # Combine edge and object detection
-        combined = np.maximum(edges_dilated / 255.0, object_mask)
+        # Morphological cleanup: close small gaps, remove tiny noise
+        kernel = np.ones((3, 3), np.uint8)
+        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, kernel, iterations=1)
 
-        # Resize to attention grid
-        mask_resized = cv2.resize(
-            combined, (grid_w, grid_h), interpolation=cv2.INTER_LINEAR
+        # --- Step 2: Connected Components Analysis ---
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            object_mask, connectivity=8
         )
 
-        # Convert to soft mask (normalized)
-        mask_tensor = torch.tensor(mask_resized, dtype=torch.float32).flatten()
+        # --- Step 3: Filter blobs to find the cube ---
+        total_pixels = img_h * img_w
+        candidate_labels = []
+
+        for i in range(1, num_labels):  # skip background (label 0)
+            x, y, w, h, area = stats[i]
+
+            # Skip very large blobs (likely robot arm): > 8% of image
+            if area > total_pixels * 0.08:
+                continue
+
+            # Skip very tiny noise: < 0.1% of image
+            if area < total_pixels * 0.001:
+                continue
+
+            # Skip blobs touching image border (robot arm enters from edges)
+            touches_border = (
+                x <= 1 or y <= 1 or
+                (x + w) >= img_w - 1 or (y + h) >= img_h - 1
+            )
+            if touches_border:
+                continue
+
+            candidate_labels.append((i, area))
+
+        # Build final mask: keep only the smallest qualifying blob(s)
+        cube_mask = np.zeros((img_h, img_w), dtype=np.float32)
+
+        if candidate_labels:
+            # Sort by area, pick the smallest (most likely the cube)
+            candidate_labels.sort(key=lambda x: x[1])
+            # Take smallest blob; if multiple small blobs exist, take up to 2
+            for label_id, area in candidate_labels[:2]:
+                cube_mask[labels == label_id] = 1.0
+        else:
+            # Fallback: if no candidates, use original object_mask
+            # (better than empty mask)
+            cube_mask = object_mask.astype(np.float32)
+
+        # --- Step 4: Max Pooling to 16x16 grid ---
+        block_h = img_h // grid_h
+        block_w = img_w // grid_w
+        mask_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
+
+        for i in range(grid_h):
+            for j in range(grid_w):
+                block = cube_mask[
+                    i * block_h : (i + 1) * block_h,
+                    j * block_w : (j + 1) * block_w,
+                ]
+                mask_grid[i, j] = np.max(block) if block.size > 0 else 0.0
+
+        # --- Debug visualization ---
+        if debug_save_path:
+            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+            axes[0].imshow(d_norm, cmap="viridis")
+            axes[0].set_title("Depth (normalized)")
+            axes[1].imshow(object_mask, cmap="gray")
+            axes[1].set_title("All objects (pre-filter)")
+            axes[2].imshow(cube_mask, cmap="gray")
+            axes[2].set_title("Cube only (post-filter)")
+            axes[3].imshow(mask_grid, cmap="hot", interpolation="nearest")
+            axes[3].set_title(f"16x16 mask (max pool)\n{int(mask_grid.sum())} active patches")
+            for ax in axes:
+                ax.axis("off")
+            plt.tight_layout()
+            plt.savefig(debug_save_path, dpi=100, bbox_inches="tight")
+            plt.close()
+
+        # Convert to normalized tensor
+        mask_tensor = torch.tensor(mask_grid, dtype=torch.float32).flatten()
         if mask_tensor.sum() > 1e-6:
             mask_tensor = mask_tensor / mask_tensor.sum()
         else:
+            # Empty mask fallback: uniform (won't bias attention)
             mask_tensor = torch.ones_like(mask_tensor) / mask_tensor.numel()
 
         return mask_tensor.unsqueeze(0)  # [1, 256]
@@ -300,6 +381,7 @@ class ControlMLLMVLAPipeline:
         image: Image.Image,
         instruction: str,
         depth_map: np.ndarray,
+        debug_save_dir: Optional[str] = None,
     ) -> torch.Tensor:
         """
         ControlMLLM-style test-time optimization.
@@ -311,6 +393,7 @@ class ControlMLLMVLAPipeline:
             image: RGB observation
             instruction: task instruction
             depth_map: depth from DA V2
+            debug_save_dir: if set, save mask debug images here
 
         Returns:
             visual_prompt: optimized [1, N_patches, 4096]
@@ -318,9 +401,21 @@ class ControlMLLMVLAPipeline:
         model_dtype = next(self.vla.parameters()).dtype
         device = self.vlm.device
 
-        # 1. Create spatial mask from depth
-        mask = self.create_spatial_mask(depth_map)  # [1, 256]
+        # 1. Create spatial mask from depth (with CCA filtering)
+        mask_debug_path = None
+        if debug_save_dir:
+            os.makedirs(debug_save_dir, exist_ok=True)
+            mask_debug_path = os.path.join(
+                debug_save_dir, f"mask_step_{self._step_count:03d}.png"
+            )
+        mask = self.create_spatial_mask(
+            depth_map, debug_save_path=mask_debug_path
+        )  # [1, 256]
         mask = mask.to(device)
+
+        # Log mask stats
+        n_active = (mask > 0).sum().item()
+        print(f"    Mask: {n_active}/256 active patches")
 
         # 2. Get base embeddings
         base_embeddings, n_image_tokens, _ = self._get_embeddings(image, instruction)
@@ -333,10 +428,11 @@ class ControlMLLMVLAPipeline:
             device=device, dtype=torch.float32,
         ).requires_grad_(True)
 
-        # Adam optimizer state
-        m = torch.zeros_like(visual_prompt)
-        s = torch.zeros_like(visual_prompt)
-        beta1, beta2, eps = 0.9, 0.999, 1e-3
+        # Optimizer state (Adam only, SGD needs no state)
+        if self.optimizer == "adam":
+            m = torch.zeros_like(visual_prompt)
+            s = torch.zeros_like(visual_prompt)
+            beta1, beta2, eps = 0.9, 0.999, 1e-3
 
         # 4. Optimization loop
         for t in range(1, self.T + 1):
@@ -360,17 +456,22 @@ class ControlMLLMVLAPipeline:
             # Backprop
             grad = torch.autograd.grad(loss, visual_prompt)[0]
 
-            # Adam update
-            m = beta1 * m + (1 - beta1) * grad
-            s = beta2 * s + (1 - beta2) * grad.pow(2)
-            m_hat = m / (1 - beta1 ** t)
-            s_hat = s / (1 - beta2 ** t)
+            if self.optimizer == "adam":
+                # Adam update
+                m = beta1 * m + (1 - beta1) * grad
+                s = beta2 * s + (1 - beta2) * grad.pow(2)
+                m_hat = m / (1 - beta1 ** t)
+                s_hat = s / (1 - beta2 ** t)
+                visual_prompt = (
+                    visual_prompt - self.lr * m_hat / (torch.sqrt(s_hat) + eps)
+                ).detach().requires_grad_(True)
+            else:
+                # SGD update (simpler, better for short T)
+                visual_prompt = (
+                    visual_prompt - self.lr * grad
+                ).detach().requires_grad_(True)
 
-            visual_prompt = (
-                visual_prompt - self.lr * m_hat / (torch.sqrt(s_hat) + eps)
-            ).detach().requires_grad_(True)
-
-            if t == 1 or t == self.T:
+            if t == 1 or t == self.T or t % 5 == 0:
                 print(f"    [Optim step {t}/{self.T}] loss={loss.item():.4f}")
 
         return visual_prompt.detach().to(model_dtype)
@@ -410,8 +511,11 @@ class ControlMLLMVLAPipeline:
                                        or self.optimize_freq == 1
                                        or self._visual_prompt is None):
             print(f"  [Step {self._step_count}] Optimizing visual prompt...")
+            # Save debug masks for first 3 steps
+            debug_dir = kwargs.get("debug_save_dir", None)
             self._visual_prompt = self.optimize_visual_prompt(
-                image, instruction, depth_map
+                image, instruction, depth_map,
+                debug_save_dir=debug_dir,
             )
 
         # 3. Register hook to inject during predict_action
@@ -448,3 +552,117 @@ class ControlMLLMVLAPipeline:
         """Reset state for new episode."""
         self._visual_prompt = None
         self._step_count = 0
+
+    # ================================================================
+    # Attention Diagnostics
+    # ================================================================
+
+    def visualize_attention_by_layer(
+        self,
+        image: Image.Image,
+        instruction: str,
+        save_dir: str = "/content/attention_diagnosis",
+    ) -> dict:
+        """
+        Diagnostic: visualize which layers attend to image tokens.
+
+        Runs ONE forward pass and saves per-layer attention heatmaps
+        (last token → image tokens) overlaid on 16x16 grid.
+        Use this BEFORE running optimization to find the right layer range.
+
+        Args:
+            image: RGB observation
+            instruction: task instruction
+            save_dir: directory to save heatmaps
+
+        Returns:
+            dict mapping layer_idx → activation stats
+        """
+        os.makedirs(save_dir, exist_ok=True)
+        model_dtype = next(self.vla.parameters()).dtype
+
+        base_embeddings, n_image_tokens, _ = self._get_embeddings(image, instruction)
+        image_start = 1
+        image_end = 1 + n_image_tokens
+        n_spatial = n_image_tokens - 1  # exclude CLS
+
+        with torch.no_grad():
+            outputs = self.llm(
+                inputs_embeds=base_embeddings.to(model_dtype),
+                output_attentions=True,
+                return_dict=True,
+            )
+
+        layer_stats = {}
+        n_layers = len(outputs.attentions)
+
+        # Create summary figure: all layers in one grid
+        cols = 8
+        rows = (n_layers + cols - 1) // cols
+        fig_all, axes_all = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
+        axes_flat = axes_all.flatten()
+
+        for layer_idx in range(n_layers):
+            attn = outputs.attentions[layer_idx]  # [1, heads, seq, seq]
+
+            # Average across heads
+            attn_mean = attn.mean(dim=1)  # [1, seq, seq]
+
+            # Last token → image tokens
+            last_to_img = attn_mean[0, -1, image_start:image_end]  # [n_image_tokens]
+
+            # Skip CLS (first image token), reshape to 16x16
+            spatial_attn = last_to_img[1:].detach().cpu().numpy()  # [256]
+
+            # Normalize for visualization
+            if spatial_attn.max() > 0:
+                spatial_vis = spatial_attn / spatial_attn.max()
+            else:
+                spatial_vis = spatial_attn
+
+            heatmap = spatial_vis.reshape(16, 16)
+
+            # Stats
+            layer_stats[layer_idx] = {
+                "mean": float(spatial_attn.mean()),
+                "max": float(spatial_attn.max()),
+                "std": float(spatial_attn.std()),
+                "sum": float(spatial_attn.sum()),
+            }
+
+            # Plot in grid
+            ax = axes_flat[layer_idx]
+            ax.imshow(heatmap, cmap="hot", interpolation="nearest", vmin=0, vmax=1)
+            ax.set_title(
+                f"L{layer_idx}\nmax={spatial_attn.max():.4f}",
+                fontsize=8,
+            )
+            ax.axis("off")
+
+        # Hide unused axes
+        for idx in range(n_layers, len(axes_flat)):
+            axes_flat[idx].axis("off")
+
+        fig_all.suptitle(
+            "Attention: last token → image patches (per layer)", fontsize=14
+        )
+        plt.tight_layout()
+        fig_all.savefig(
+            os.path.join(save_dir, "all_layers_attention.png"),
+            dpi=150, bbox_inches="tight",
+        )
+        plt.close(fig_all)
+
+        # Print summary: which layers have strongest image attention
+        print(f"\n{'='*60}")
+        print("Attention Diagnosis: last token → image patches")
+        print(f"{'='*60}")
+        print(f"{'Layer':>6} {'Mean':>10} {'Max':>10} {'Std':>10}")
+        print(f"{'-'*40}")
+        for idx in sorted(layer_stats.keys()):
+            s = layer_stats[idx]
+            marker = " <<<" if s["max"] > 0.01 else ""
+            print(f"  L{idx:2d}   {s['mean']:.6f}  {s['max']:.6f}  {s['std']:.6f}{marker}")
+
+        print(f"\nHeatmaps saved to: {save_dir}/all_layers_attention.png")
+        return layer_stats

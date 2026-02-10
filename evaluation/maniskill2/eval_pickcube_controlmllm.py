@@ -77,7 +77,7 @@ def run_evaluation(
     optimize_freq: int = 1,
     optimizer: str = "sgd",
     init_scale: float = 0.05,
-    sensor_resolution: int = 128,
+    sensor_resolution: int = 224,
 ) -> Dict[str, Any]:
     """
     Run PickCube evaluation with ControlMLLM visual prompt optimization.

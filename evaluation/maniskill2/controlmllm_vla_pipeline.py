@@ -4,18 +4,14 @@ ControlMLLM-style Visual Prompt Optimization for MemoryVLA.
 Test-time adaptation: optimizes a visual prompt using the frozen LLM's
 self-attention as signal, guided by depth-derived spatial masks.
 
-Key difference from naive depth injection:
-    Naive:       Pv = fixed depth_tokens (no optimization)
-    ControlMLLM: Pv = zeros → iterative gradient optimization → optimized prompt
-
 Pipeline:
-    1. DA V2 → depth map → spatial mask (where objects are)
-    2. Initialize visual_prompt (Pv) = zeros [1, N_patches, 4096]
+    1. DA V2 → depth map → pixel-level anomaly detection → spatial mask (16×16)
+    2. DA V2 → depth map → vision backbone → depth tokens → Pv init (scaled)
     3. Optimization loop (T iterations):
         - Add Pv to image token embeddings
         - Forward through frozen LLM → extract attention maps
-        - Loss = alpha * (1 - attention_inside_mask)^2
-        - Update Pv via Adam or SGD
+        - Loss = -alpha * log(attention_inside_mask)
+        - Update Pv via SGD
     4. Inject optimized Pv into MemoryVLA's predict_action via hook
 
 Reference: ControlMLLM (NeurIPS 2024) - https://github.com/mrwu-mac/ControlMLLM
@@ -113,74 +109,128 @@ class ControlMLLMVLAPipeline:
         rgb_image: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         """
-        Create attention mask using HSV saturation peak detection.
+        Create attention mask via pixel-level depth anomaly detection.
 
-        The cube is the MOST SATURATED object in the scene:
-        - Cube: vivid red/green/blue (high saturation)
-        - Table: brown wood (moderate saturation)
-        - Robot arm: gray/silver (low saturation)
-        - Background sky: gray (low saturation)
+        Key insight: the target object (cube) is visible at 128×128 pixel level
+        but disappears when mean-pooled to 16×16 grid. So we detect at pixel
+        level first, then map to grid.
 
-        Simply take the top-K most saturated patches = cube location.
+        Steps:
+            1. GaussianBlur depth → smooth background estimate
+            2. deviation = smooth - actual → positive = closer than surface
+            3. Threshold → object pixels (both robot arm + cube)
+            4. Connected components → size filter (small=cube, large=robot arm)
+            5. Map detected pixels to 16×16 grid + 3×3 neighborhood
 
         Args:
-            depth_map: Depth values (unused, kept for API compat)
-            grid_h, grid_w: Attention grid size (16x16 for 256 patches)
+            depth_map: Depth values from DA V2 (128×128)
+            grid_h, grid_w: Attention grid size (16×16 for 256 patches)
             debug_save_path: If set, save visualization
-            rgb_image: RGB image (REQUIRED)
+            rgb_image: RGB image (for debug visualization)
 
         Returns:
             mask: Tensor [1, grid_h * grid_w] (normalized)
         """
-        if rgb_image is None:
+        if depth_map is None:
             mask_tensor = torch.ones(grid_h * grid_w) / (grid_h * grid_w)
             return mask_tensor.unsqueeze(0)
 
-        img_h, img_w = rgb_image.shape[:2]
-        block_h = img_h // grid_h
-        block_w = img_w // grid_w
+        depth = depth_map.astype(np.float32)
+        h, w = depth.shape[:2]
+        block_h = h // grid_h
+        block_w = w // grid_w
 
-        # --- Step 1: Compute per-patch saturation ---
-        hsv = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2HSV)
-        grid_sat = np.zeros((grid_h, grid_w), dtype=np.float32)
+        # --- Step 1: Estimate smooth background (table surface) ---
+        # Large Gaussian blur smooths out small objects (cube ~3-5px)
+        # but preserves the overall depth gradient of the table
+        ksize = 31  # must be odd; large enough to blur over cube
+        smooth = cv2.GaussianBlur(depth, (ksize, ksize), 0)
 
+        # --- Step 2: Find pixels closer than expected (protruding objects) ---
+        # DA V2: lower value = closer to camera
+        # Objects on table are closer → depth < smooth background
+        deviation = smooth - depth  # positive = closer than background
+
+        # Adaptive threshold based on deviation statistics
+        dev_mean = deviation.mean()
+        dev_std = deviation.std()
+        threshold = dev_mean + dev_std * 2.0  # top ~2.5% deviations
+        # Ensure minimum threshold to avoid noise
+        threshold = max(threshold, dev_std * 1.0)
+
+        object_mask = (deviation > threshold).astype(np.uint8)
+
+        # --- Step 3: Connected components + size filtering ---
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            object_mask, connectivity=8
+        )
+
+        # Size filter: cube is small (~5-30 px at 128×128), robot arm is large (100+)
+        min_area = 2    # remove single-pixel noise
+        max_area = 100  # remove robot arm
+        target_mask = np.zeros_like(object_mask)
+        kept_components = []
+
+        for label_id in range(1, num_labels):  # skip background (0)
+            area = stats[label_id, cv2.CC_STAT_AREA]
+            if min_area <= area <= max_area:
+                target_mask[labels == label_id] = 1
+                cx = centroids[label_id][0]
+                cy = centroids[label_id][1]
+                kept_components.append((label_id, area, cx, cy))
+
+        # --- Step 4: Map pixel detections to 16×16 grid ---
+        mask_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
         for i in range(grid_h):
             for j in range(grid_w):
-                block = hsv[i * block_h:(i + 1) * block_h,
-                            j * block_w:(j + 1) * block_w, 1]
-                grid_sat[i, j] = np.mean(block)
+                block = target_mask[i * block_h:(i + 1) * block_h,
+                                    j * block_w:(j + 1) * block_w]
+                if block.sum() > 0:
+                    mask_grid[i, j] = 1.0
 
-        # --- Step 2: Find THE most saturated patch (= cube center) ---
-        # argmax → single peak patch + 3x3 neighborhood = max 9 patches
-        flat_sat = grid_sat.flatten()
-        peak_idx = int(np.argmax(flat_sat))
-        peak_row, peak_col = peak_idx // grid_w, peak_idx % grid_w
-        peak_threshold = flat_sat[peak_idx]
+        # Add 3×3 neighborhood around each detected grid cell
+        if mask_grid.sum() > 0:
+            detected = mask_grid.copy()
+            for i in range(grid_h):
+                for j in range(grid_w):
+                    if detected[i, j] > 0:
+                        for di in range(-1, 2):
+                            for dj in range(-1, 2):
+                                r, c = i + di, j + dj
+                                if 0 <= r < grid_h and 0 <= c < grid_w:
+                                    mask_grid[r, c] = 1.0
 
-        # Single peak patch
-        peak_patches = np.zeros((grid_h, grid_w), dtype=np.float32)
-        peak_patches[peak_row, peak_col] = 1.0
-
-        # 3x3 neighborhood around peak = max 9 patches
-        mask_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
-        for di in range(-1, 2):
-            for dj in range(-1, 2):
-                r, c = peak_row + di, peak_col + dj
-                if 0 <= r < grid_h and 0 <= c < grid_w:
-                    mask_grid[r, c] = 1.0
+        # --- Fallback: if nothing found, use center region ---
+        if mask_grid.sum() == 0:
+            print("    WARNING: No small depth anomaly found, using center fallback")
+            for i in range(grid_h // 2 - 1, grid_h // 2 + 2):
+                for j in range(grid_w // 2 - 1, grid_w // 2 + 2):
+                    mask_grid[i, j] = 1.0
 
         # --- Debug visualization ---
         if debug_save_path:
-            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-            axes[0].imshow(rgb_image)
+            fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+            if rgb_image is not None:
+                axes[0].imshow(rgb_image)
+            else:
+                axes[0].imshow(depth, cmap="inferno")
             axes[0].set_title("RGB input")
-            axes[1].imshow(grid_sat, cmap="hot", interpolation="nearest")
-            axes[1].set_title(f"Saturation (per patch)\nmax={grid_sat.max():.1f}")
-            axes[2].imshow(peak_patches, cmap="gray",
-                          interpolation="nearest")
-            axes[2].set_title(f"Peak (argmax)\nsat={peak_threshold:.1f} @({peak_row},{peak_col})")
-            axes[3].imshow(mask_grid, cmap="hot", interpolation="nearest")
-            axes[3].set_title(f"Final mask (3x3)\n{int(mask_grid.sum())} patches")
+
+            axes[1].imshow(depth, cmap="inferno", interpolation="nearest")
+            axes[1].set_title("DA V2 depth (128×128)")
+
+            axes[2].imshow(deviation, cmap="hot", interpolation="nearest")
+            axes[2].set_title(f"Deviation from smooth\nthr={threshold:.2f}")
+
+            axes[3].imshow(target_mask, cmap="gray", interpolation="nearest")
+            comp_info = ", ".join(
+                f"{a}px" for _, a, _, _ in kept_components
+            ) if kept_components else "none"
+            axes[3].set_title(f"Small objects (pixel)\n[{comp_info}]")
+
+            axes[4].imshow(mask_grid, cmap="hot", interpolation="nearest")
+            axes[4].set_title(f"Final mask (16×16)\n{int(mask_grid.sum())} patches")
+
             for ax in axes:
                 ax.axis("off")
             plt.tight_layout()
@@ -574,7 +624,6 @@ class ControlMLLMVLAPipeline:
         Call this to see what the model sees and what the mask looks like.
         """
         rgb = np.array(image)
-        # Depth is optional now (mask uses RGB color saliency)
         depth = self.estimate_depth(image)
         if depth is None:
             depth = np.zeros(rgb.shape[:2], dtype=np.float32)

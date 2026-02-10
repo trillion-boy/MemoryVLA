@@ -108,135 +108,118 @@ class ControlMLLMVLAPipeline:
     def create_spatial_mask(
         self, depth_map: np.ndarray, grid_h: int = 16, grid_w: int = 16,
         debug_save_path: Optional[str] = None,
+        rgb_image: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         """
-        Create attention mask from depth map, targeting ONLY the small
-        manipulation object (cube) and filtering out the robot arm.
+        Create attention mask from depth map using depth peak detection.
 
-        Strategy:
-            1. Find regions different from the table (median depth)
-            2. Connected Components Analysis (CCA) to separate blobs
-            3. Filter: keep only the SMALLEST isolated blob (= cube)
-               - Remove large blobs (robot arm)
-               - Remove border-connected blobs (robot arm enters from edge)
-            4. Max Pooling to 16x16 grid (preserves small objects)
+        Strategy (simpler, more robust than CCA):
+            1. Compute depth at 16x16 grid level directly
+            2. Find patches with depth significantly different from table
+            3. Among those, pick the most "peaky" small cluster
+               (cube = isolated depth peak on flat table)
+
+        The key insight: work at 16x16 grid resolution from the start,
+        avoiding pixel-level noise at 128x128.
 
         Args:
             depth_map: Depth values (H, W) from DA V2
             grid_h, grid_w: Attention grid size (16x16 for 256 patches)
             debug_save_path: If set, save mask visualization for debugging
+            rgb_image: Optional RGB image for debug visualization
 
         Returns:
             mask: Tensor [1, grid_h * grid_w] (normalized)
         """
         d = depth_map.copy().astype(np.float32)
-        d_min, d_max = d.min(), d.max()
-        if d_max - d_min > 1e-6:
-            d_norm = (d - d_min) / (d_max - d_min)
-        else:
-            d_norm = np.zeros_like(d)
+        img_h, img_w = d.shape
 
-        img_h, img_w = d_norm.shape
-
-        # --- Step 1: Find non-table regions ---
-        median_depth = np.median(d_norm)
-        object_mask = (np.abs(d_norm - median_depth) > 0.06).astype(np.uint8)
-
-        # Morphological cleanup: close small gaps, remove tiny noise
-        kernel = np.ones((3, 3), np.uint8)
-        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-        object_mask = cv2.morphologyEx(object_mask, cv2.MORPH_OPEN, kernel, iterations=1)
-
-        # --- Step 2: Connected Components Analysis ---
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            object_mask, connectivity=8
-        )
-
-        # --- Step 3: Filter blobs to find the cube ---
-        total_pixels = img_h * img_w
-        all_blobs = []  # (label_id, area, touches_border)
-
-        for i in range(1, num_labels):  # skip background (label 0)
-            x, y, w, h, area = stats[i]
-
-            # Skip very tiny noise: < 4 pixels
-            if area < 4:
-                continue
-
-            touches_border = (
-                x <= 1 or y <= 1 or
-                (x + w) >= img_w - 1 or (y + h) >= img_h - 1
-            )
-
-            all_blobs.append((i, area, touches_border))
-
-        # Strategy: prefer small, non-border blobs (= cube)
-        # Cube at 128x128 is roughly 8-15px wide → 64-225 pixels area
-        # At 16x16 grid that's ~2-6 patches
-        max_cube_area = total_pixels * 0.03  # max 3% of image (~500px at 128x128)
-
-        interior_blobs = [(i, a) for i, a, tb in all_blobs if not tb and a <= max_cube_area]
-        small_border = [(i, a) for i, a, tb in all_blobs if tb and a <= max_cube_area]
-
-        cube_mask = np.zeros((img_h, img_w), dtype=np.float32)
-
-        if interior_blobs:
-            # Sort by area, pick smallest interior blob (most likely cube)
-            interior_blobs.sort(key=lambda x: x[1])
-            label_id, area = interior_blobs[0]
-            cube_mask[labels == label_id] = 1.0
-            # Dilate slightly to ensure coverage in 16x16 grid
-            dil_kernel = np.ones((3, 3), np.uint8)
-            cube_mask = cv2.dilate(cube_mask, dil_kernel, iterations=1)
-        elif small_border:
-            small_border.sort(key=lambda x: x[1])
-            label_id, area = small_border[0]
-            cube_mask[labels == label_id] = 1.0
-            dil_kernel = np.ones((3, 3), np.uint8)
-            cube_mask = cv2.dilate(cube_mask, dil_kernel, iterations=1)
-        else:
-            # Fallback: pick the blob closest to image center
-            # (cube is usually near center of workspace)
-            cy, cx = img_h / 2, img_w / 2
-            best_label, best_dist = None, float('inf')
-            for i, area, tb in all_blobs:
-                blob_cy, blob_cx = centroids[i]
-                dist = np.sqrt((blob_cy - cy)**2 + (blob_cx - cx)**2)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_label = i
-            if best_label is not None:
-                cube_mask[labels == best_label] = 1.0
-            else:
-                # Absolute fallback: small center region
-                r = max(img_h // 10, 3)
-                icy, icx = int(cy), int(cx)
-                cube_mask[icy - r:icy + r, icx - r:icx + r] = 1.0
-
-        # --- Step 4: Max Pooling to 16x16 grid ---
+        # --- Step 1: Compute grid-level depth statistics ---
         block_h = img_h // grid_h
         block_w = img_w // grid_w
-        mask_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
+        grid_depth = np.zeros((grid_h, grid_w), dtype=np.float32)
+        grid_std = np.zeros((grid_h, grid_w), dtype=np.float32)
 
         for i in range(grid_h):
             for j in range(grid_w):
-                block = cube_mask[
-                    i * block_h : (i + 1) * block_h,
-                    j * block_w : (j + 1) * block_w,
-                ]
-                mask_grid[i, j] = np.max(block) if block.size > 0 else 0.0
+                block = d[i * block_h:(i + 1) * block_h,
+                          j * block_w:(j + 1) * block_w]
+                grid_depth[i, j] = np.mean(block)
+                grid_std[i, j] = np.std(block)
+
+        # --- Step 2: Find table surface (dominant depth) ---
+        # Table is the largest flat area → mode of grid depths
+        table_depth = np.median(grid_depth)
+
+        # Deviation from table: how different is each patch
+        deviation = np.abs(grid_depth - table_depth)
+        dev_threshold = np.percentile(deviation, 75)  # top 25% most different
+
+        # --- Step 3: Identify object patches ---
+        # Object patches = significantly different from table + high local variation
+        object_patches = (deviation > dev_threshold).astype(np.float32)
+
+        # --- Step 4: Filter to find cube (smallest cluster, away from edges) ---
+        # Remove edge patches (robot arm typically at edges)
+        edge_mask = np.ones((grid_h, grid_w), dtype=np.float32)
+        edge_mask[0, :] = 0  # top row
+        edge_mask[-1, :] = 0  # bottom row
+        edge_mask[:, 0] = 0  # left col
+        edge_mask[:, -1] = 0  # right col
+
+        interior_objects = object_patches * edge_mask
+
+        # CCA on the 16x16 grid (much simpler than on 128x128!)
+        interior_uint8 = interior_objects.astype(np.uint8)
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            interior_uint8, connectivity=4
+        )
+
+        # Pick the smallest non-trivial cluster
+        best_label = None
+        best_area = float('inf')
+        for i in range(1, num_labels):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if 1 <= area <= 12 and area < best_area:  # 1-12 patches (cube-sized)
+                best_area = area
+                best_label = i
+
+        if best_label is not None:
+            mask_grid = (labels == best_label).astype(np.float32)
+            # Dilate by 1 patch for margin
+            dil_kernel = np.ones((3, 3), np.uint8)
+            mask_grid = cv2.dilate(mask_grid, dil_kernel, iterations=1)
+        elif interior_objects.sum() > 0 and interior_objects.sum() <= 20:
+            # Use all interior object patches if few enough
+            mask_grid = interior_objects
+        else:
+            # Fallback: top-4 most deviant interior patches
+            flat = (deviation * edge_mask).flatten()
+            topk_idx = np.argsort(flat)[-4:]
+            mask_grid = np.zeros(grid_h * grid_w, dtype=np.float32)
+            mask_grid[topk_idx] = 1.0
+            mask_grid = mask_grid.reshape(grid_h, grid_w)
 
         # --- Debug visualization ---
         if debug_save_path:
-            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
-            axes[0].imshow(d_norm, cmap="viridis")
-            axes[0].set_title("Depth (normalized)")
-            axes[1].imshow(object_mask, cmap="gray")
-            axes[1].set_title("All objects (pre-filter)")
-            axes[2].imshow(cube_mask, cmap="gray")
-            axes[2].set_title("Cube only (post-filter)")
-            axes[3].imshow(mask_grid, cmap="hot", interpolation="nearest")
-            axes[3].set_title(f"16x16 mask (max pool)\n{int(mask_grid.sum())} active patches")
+            n_panels = 5 if rgb_image is not None else 4
+            fig, axes = plt.subplots(1, n_panels, figsize=(n_panels * 4, 4))
+            idx = 0
+            if rgb_image is not None:
+                axes[idx].imshow(rgb_image)
+                axes[idx].set_title("RGB input")
+                idx += 1
+            axes[idx].imshow(grid_depth, cmap="viridis", interpolation="nearest")
+            axes[idx].set_title("16x16 grid depth")
+            idx += 1
+            axes[idx].imshow(deviation, cmap="hot", interpolation="nearest")
+            axes[idx].set_title(f"Deviation from table\nthr={dev_threshold:.3f}")
+            idx += 1
+            axes[idx].imshow(interior_objects, cmap="gray", interpolation="nearest")
+            axes[idx].set_title(f"Interior objects\n{int(interior_objects.sum())} patches")
+            idx += 1
+            axes[idx].imshow(mask_grid, cmap="hot", interpolation="nearest")
+            axes[idx].set_title(f"Final mask\n{int(mask_grid.sum())} patches")
             for ax in axes:
                 ax.axis("off")
             plt.tight_layout()
@@ -248,7 +231,6 @@ class ControlMLLMVLAPipeline:
         if mask_tensor.sum() > 1e-6:
             mask_tensor = mask_tensor / mask_tensor.sum()
         else:
-            # Empty mask fallback: uniform (won't bias attention)
             mask_tensor = torch.ones_like(mask_tensor) / mask_tensor.numel()
 
         return mask_tensor.unsqueeze(0)  # [1, 256]
@@ -423,8 +405,10 @@ class ControlMLLMVLAPipeline:
             mask_debug_path = os.path.join(
                 debug_save_dir, f"mask_step_{self._step_count:03d}.png"
             )
+        rgb_for_debug = np.array(image) if mask_debug_path else None
         mask = self.create_spatial_mask(
-            depth_map, debug_save_path=mask_debug_path
+            depth_map, debug_save_path=mask_debug_path,
+            rgb_image=rgb_for_debug,
         )  # [1, 256]
         mask = mask.to(device)
 
@@ -570,6 +554,28 @@ class ControlMLLMVLAPipeline:
         """Reset state for new episode."""
         self._visual_prompt = None
         self._step_count = 0
+
+    def debug_first_frame(
+        self,
+        image: Image.Image,
+        save_path: str = "/content/debug_first_frame.png",
+    ):
+        """
+        Save RGB + depth + mask visualization for a single frame.
+        Call this to see what the model sees and what the mask looks like.
+        """
+        rgb = np.array(image)
+        depth = self.estimate_depth(image)
+
+        if depth is None:
+            print("No depth model available")
+            return
+
+        # Create mask with debug
+        self.create_spatial_mask(
+            depth, debug_save_path=save_path, rgb_image=rgb
+        )
+        print(f"Debug visualization saved to: {save_path}")
 
     # ================================================================
     # Attention Diagnostics

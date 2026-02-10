@@ -154,42 +154,45 @@ class ControlMLLMVLAPipeline:
 
         # --- Step 3: Filter blobs to find the cube ---
         total_pixels = img_h * img_w
-        candidate_labels = []
+        all_blobs = []  # (label_id, area, touches_border)
 
         for i in range(1, num_labels):  # skip background (label 0)
             x, y, w, h, area = stats[i]
 
-            # Skip very large blobs (likely robot arm): > 8% of image
-            if area > total_pixels * 0.08:
+            # Skip very tiny noise: < 4 pixels
+            if area < 4:
                 continue
 
-            # Skip very tiny noise: < 0.1% of image
-            if area < total_pixels * 0.001:
-                continue
-
-            # Skip blobs touching image border (robot arm enters from edges)
             touches_border = (
                 x <= 1 or y <= 1 or
                 (x + w) >= img_w - 1 or (y + h) >= img_h - 1
             )
-            if touches_border:
-                continue
 
-            candidate_labels.append((i, area))
+            all_blobs.append((i, area, touches_border))
 
-        # Build final mask: keep only the smallest qualifying blob(s)
+        # Strategy: prefer small, non-border blobs (= cube)
+        # If none found, fall back to smallest blob overall
+        interior_blobs = [(i, a) for i, a, tb in all_blobs if not tb]
+        border_blobs = [(i, a) for i, a, tb in all_blobs if tb]
+
         cube_mask = np.zeros((img_h, img_w), dtype=np.float32)
 
-        if candidate_labels:
-            # Sort by area, pick the smallest (most likely the cube)
-            candidate_labels.sort(key=lambda x: x[1])
-            # Take smallest blob; if multiple small blobs exist, take up to 2
-            for label_id, area in candidate_labels[:2]:
+        if interior_blobs:
+            # Sort by area, pick smallest interior blob (most likely cube)
+            interior_blobs.sort(key=lambda x: x[1])
+            for label_id, area in interior_blobs[:2]:
                 cube_mask[labels == label_id] = 1.0
+        elif border_blobs:
+            # All blobs touch border — pick the smallest one
+            border_blobs.sort(key=lambda x: x[1])
+            label_id, area = border_blobs[0]
+            cube_mask[labels == label_id] = 1.0
         else:
-            # Fallback: if no candidates, use original object_mask
-            # (better than empty mask)
-            cube_mask = object_mask.astype(np.float32)
+            # No blobs at all — create a small center-focused mask
+            # (reasonable prior: objects are usually near center)
+            cy, cx = img_h // 2, img_w // 2
+            r = max(img_h // 8, 4)
+            cube_mask[cy - r:cy + r, cx - r:cx + r] = 1.0
 
         # --- Step 4: Max Pooling to 16x16 grid ---
         block_h = img_h // grid_h
@@ -512,7 +515,7 @@ class ControlMLLMVLAPipeline:
                                        or self._visual_prompt is None):
             print(f"  [Step {self._step_count}] Optimizing visual prompt...")
             # Save debug masks for first 3 steps
-            debug_dir = kwargs.get("debug_save_dir", None)
+            debug_dir = kwargs.pop("debug_save_dir", None)
             self._visual_prompt = self.optimize_visual_prompt(
                 image, instruction, depth_map,
                 debug_save_dir=debug_dir,

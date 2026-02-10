@@ -584,7 +584,17 @@ class ControlMLLMVLAPipeline:
         base_embeddings, n_image_tokens, _ = self._get_embeddings(image, instruction)
         image_start = 1
         image_end = 1 + n_image_tokens
-        n_spatial = n_image_tokens - 1  # exclude CLS
+
+        # Determine grid size: 256 spatial patches → 16x16
+        # n_image_tokens can be 256 (no CLS) or 257 (CLS + 256 spatial)
+        if n_image_tokens == 257:
+            spatial_offset = 1  # skip CLS token
+            n_spatial = 256
+        else:
+            spatial_offset = 0
+            n_spatial = n_image_tokens
+        grid_side = int(np.sqrt(n_spatial))
+        print(f"  Image tokens: {n_image_tokens} (spatial: {n_spatial}, grid: {grid_side}x{grid_side})")
 
         with torch.no_grad():
             outputs = self.llm(
@@ -611,8 +621,8 @@ class ControlMLLMVLAPipeline:
             # Last token → image tokens
             last_to_img = attn_mean[0, -1, image_start:image_end]  # [n_image_tokens]
 
-            # Skip CLS (first image token), reshape to 16x16
-            spatial_attn = last_to_img[1:].detach().cpu().numpy()  # [256]
+            # Get spatial tokens only (skip CLS if present)
+            spatial_attn = last_to_img[spatial_offset:].detach().cpu().numpy()  # [n_spatial]
 
             # Normalize for visualization
             if spatial_attn.max() > 0:
@@ -620,7 +630,7 @@ class ControlMLLMVLAPipeline:
             else:
                 spatial_vis = spatial_attn
 
-            heatmap = spatial_vis.reshape(16, 16)
+            heatmap = spatial_vis.reshape(grid_side, grid_side)
 
             # Stats
             layer_stats[layer_idx] = {

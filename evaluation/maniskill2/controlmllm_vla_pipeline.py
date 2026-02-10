@@ -46,7 +46,7 @@ class ControlMLLMVLAPipeline:
         vla,
         depth_model=None,
         T: int = 10,
-        lr: float = 1.0,
+        lr: float = 5.0,
         alpha_loss: float = 400.0,
         layer_start: int = 14,
         layer_end: int = 26,
@@ -416,9 +416,12 @@ class ControlMLLMVLAPipeline:
                 outputs.attentions, mask, image_start, image_end
             )
 
-            # Backprop
+            # Backprop with gradient clipping for stability
             grad = torch.autograd.grad(loss, visual_prompt)[0]
             grad_norm = grad.norm().item()
+            max_grad_norm = 1.0
+            if grad_norm > max_grad_norm:
+                grad = grad * (max_grad_norm / grad_norm)
 
             if self.optimizer == "adam":
                 # Adam update

@@ -117,9 +117,9 @@ class ControlMLLMVLAPipeline:
 
         Steps:
             1. GaussianBlur depth → smooth background estimate
-            2. deviation = smooth - actual → positive = closer than surface
-            3. Threshold → object pixels (both robot arm + cube)
-            4. Connected components → size filter (small=cube, large=robot arm)
+            2. |deviation| = |smooth - actual| → depth anomaly (direction-agnostic)
+            3. Phase 1: Find & remove robot arm (largest anomaly component)
+            4. Phase 2: Re-threshold on table area only → find small objects (cube)
             5. Map detected pixels to 16×16 grid + 3×3 neighborhood
 
         Args:
@@ -141,34 +141,56 @@ class ControlMLLMVLAPipeline:
         block_w = w // grid_w
 
         # --- Step 1: Estimate smooth background (table surface) ---
-        # Large Gaussian blur smooths out small objects (cube ~3-5px)
-        # but preserves the overall depth gradient of the table
-        ksize = 31  # must be odd; large enough to blur over cube
+        ksize = 31  # must be odd; large enough to blur over cube (~3-5px)
         smooth = cv2.GaussianBlur(depth, (ksize, ksize), 0)
 
-        # --- Step 2: Find pixels closer than expected (protruding objects) ---
-        # DA V2: lower value = closer to camera
-        # Objects on table are closer → depth < smooth background
-        deviation = smooth - depth  # positive = closer than background
+        # Use absolute deviation (direction-agnostic: works regardless of
+        # whether DA V2 outputs higher=closer or lower=closer)
+        abs_deviation = np.abs(smooth - depth)
 
-        # Adaptive threshold based on deviation statistics
-        dev_mean = deviation.mean()
-        dev_std = deviation.std()
-        threshold = dev_mean + dev_std * 2.0  # top ~2.5% deviations
-        # Ensure minimum threshold to avoid noise
-        threshold = max(threshold, dev_std * 1.0)
+        # ---- Phase 1: Find and REMOVE robot arm (largest anomaly) ----
+        # The arm dominates deviation statistics, masking the subtle cube signal.
+        # Detect it first, mask it out, then look for small objects on the table.
+        phase1_thr = abs_deviation.mean() + abs_deviation.std() * 1.0
+        phase1_mask = (abs_deviation > phase1_thr).astype(np.uint8)
 
-        object_mask = (deviation > threshold).astype(np.uint8)
+        num_labels_p1, labels_p1, stats_p1, _ = cv2.connectedComponentsWithStats(
+            phase1_mask, connectivity=8
+        )
+        arm_mask = np.zeros_like(phase1_mask)
+        if num_labels_p1 > 1:
+            # Largest component = robot arm
+            areas_p1 = stats_p1[1:, cv2.CC_STAT_AREA]
+            arm_label = int(np.argmax(areas_p1)) + 1
+            arm_mask = (labels_p1 == arm_label).astype(np.uint8)
+            # Dilate to cover arm edges that might fragment into small components
+            arm_mask = cv2.dilate(arm_mask, np.ones((15, 15), np.uint8))
 
-        # --- Step 3: Connected components + size filtering ---
+        # ---- Phase 2: Detect small objects on table surface ----
+        # Re-compute threshold using ONLY the table area (arm excluded)
+        table_deviation = abs_deviation.copy()
+        table_deviation[arm_mask > 0] = 0
+
+        table_valid = abs_deviation[arm_mask == 0]
+        if table_valid.size > 0 and table_valid.std() > 1e-6:
+            # Lower threshold now that arm isn't inflating the statistics
+            phase2_thr = table_valid.mean() + table_valid.std() * 2.0
+            phase2_thr = max(phase2_thr, table_valid.std() * 1.0)
+        else:
+            phase2_thr = abs_deviation.std() * 0.5
+
+        target_candidates = (
+            (table_deviation > phase2_thr) & (arm_mask == 0)
+        ).astype(np.uint8)
+
+        # CCA + size filter on table anomalies
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            object_mask, connectivity=8
+            target_candidates, connectivity=8
         )
 
-        # Size filter: cube is small (~5-30 px at 128×128), robot arm is large (100+)
         min_area = 2    # remove single-pixel noise
-        max_area = 100  # remove robot arm
-        target_mask = np.zeros_like(object_mask)
+        max_area = 80   # anything larger is not the cube
+        target_mask = np.zeros_like(target_candidates)
         kept_components = []
 
         for label_id in range(1, num_labels):  # skip background (0)
@@ -178,6 +200,8 @@ class ControlMLLMVLAPipeline:
                 cx = centroids[label_id][0]
                 cy = centroids[label_id][1]
                 kept_components.append((label_id, area, cx, cy))
+
+        threshold = phase2_thr  # for debug display
 
         # --- Step 4: Map pixel detections to 16×16 grid ---
         mask_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
@@ -209,7 +233,7 @@ class ControlMLLMVLAPipeline:
 
         # --- Debug visualization ---
         if debug_save_path:
-            fig, axes = plt.subplots(1, 5, figsize=(25, 5))
+            fig, axes = plt.subplots(1, 6, figsize=(30, 5))
             if rgb_image is not None:
                 axes[0].imshow(rgb_image)
             else:
@@ -219,17 +243,21 @@ class ControlMLLMVLAPipeline:
             axes[1].imshow(depth, cmap="inferno", interpolation="nearest")
             axes[1].set_title("DA V2 depth (128×128)")
 
-            axes[2].imshow(deviation, cmap="hot", interpolation="nearest")
-            axes[2].set_title(f"Deviation from smooth\nthr={threshold:.2f}")
+            axes[2].imshow(abs_deviation, cmap="hot", interpolation="nearest")
+            axes[2].set_title(f"|Deviation| from smooth\narm removed below")
 
-            axes[3].imshow(target_mask, cmap="gray", interpolation="nearest")
+            axes[3].imshow(arm_mask, cmap="gray", interpolation="nearest")
+            arm_area = int(arm_mask.sum())
+            axes[3].set_title(f"Phase 1: Arm mask\n{arm_area}px (dilated)")
+
+            axes[4].imshow(target_mask, cmap="gray", interpolation="nearest")
             comp_info = ", ".join(
                 f"{a}px" for _, a, _, _ in kept_components
             ) if kept_components else "none"
-            axes[3].set_title(f"Small objects (pixel)\n[{comp_info}]")
+            axes[4].set_title(f"Phase 2: Table objects\nthr={threshold:.3f} [{comp_info}]")
 
-            axes[4].imshow(mask_grid, cmap="hot", interpolation="nearest")
-            axes[4].set_title(f"Final mask (16×16)\n{int(mask_grid.sum())} patches")
+            axes[5].imshow(mask_grid, cmap="hot", interpolation="nearest")
+            axes[5].set_title(f"Final mask (16×16)\n{int(mask_grid.sum())} patches")
 
             for ax in axes:
                 ax.axis("off")

@@ -148,24 +148,24 @@ class ControlMLLMVLAPipeline:
                             j * block_w:(j + 1) * block_w, 1]
                 grid_sat[i, j] = np.mean(block)
 
-        # --- Step 2: Find peak saturation patches ---
-        # The cube is the most saturated → take top patches
+        # --- Step 2: Find THE most saturated patch (= cube center) ---
+        # argmax → single peak patch + 3x3 neighborhood = max 9 patches
         flat_sat = grid_sat.flatten()
-        # Use a high threshold: only the very peak
-        peak_threshold = np.percentile(flat_sat, 95)  # top 5%
-        peak_patches = (grid_sat >= peak_threshold).astype(np.float32)
+        peak_idx = int(np.argmax(flat_sat))
+        peak_row, peak_col = peak_idx // grid_w, peak_idx % grid_w
+        peak_threshold = flat_sat[peak_idx]
 
-        # If too many patches pass (>8), tighten to top-4
-        if peak_patches.sum() > 8:
-            topk_idx = np.argsort(flat_sat)[-4:]
-            peak_patches = np.zeros_like(flat_sat)
-            peak_patches[topk_idx] = 1.0
-            peak_patches = peak_patches.reshape(grid_h, grid_w)
+        # Single peak patch
+        peak_patches = np.zeros((grid_h, grid_w), dtype=np.float32)
+        peak_patches[peak_row, peak_col] = 1.0
 
-        # Dilate by 1 patch for margin
-        peak_uint8 = peak_patches.astype(np.uint8)
-        dil_kernel = np.ones((3, 3), np.uint8)
-        mask_grid = cv2.dilate(peak_uint8, dil_kernel, iterations=1).astype(np.float32)
+        # 3x3 neighborhood around peak = max 9 patches
+        mask_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
+        for di in range(-1, 2):
+            for dj in range(-1, 2):
+                r, c = peak_row + di, peak_col + dj
+                if 0 <= r < grid_h and 0 <= c < grid_w:
+                    mask_grid[r, c] = 1.0
 
         # --- Debug visualization ---
         if debug_save_path:
@@ -174,11 +174,11 @@ class ControlMLLMVLAPipeline:
             axes[0].set_title("RGB input")
             axes[1].imshow(grid_sat, cmap="hot", interpolation="nearest")
             axes[1].set_title(f"Saturation (per patch)\nmax={grid_sat.max():.1f}")
-            axes[2].imshow(peak_patches.reshape(grid_h, grid_w), cmap="gray",
+            axes[2].imshow(peak_patches, cmap="gray",
                           interpolation="nearest")
-            axes[2].set_title(f"Peak sat patches\nthr={peak_threshold:.1f}")
+            axes[2].set_title(f"Peak (argmax)\nsat={peak_threshold:.1f} @({peak_row},{peak_col})")
             axes[3].imshow(mask_grid, cmap="hot", interpolation="nearest")
-            axes[3].set_title(f"Final mask (dilated)\n{int(mask_grid.sum())} patches")
+            axes[3].set_title(f"Final mask (3x3)\n{int(mask_grid.sum())} patches")
             for ax in axes:
                 ax.axis("off")
             plt.tight_layout()

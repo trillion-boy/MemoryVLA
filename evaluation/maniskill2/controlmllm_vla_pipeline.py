@@ -46,7 +46,7 @@ class ControlMLLMVLAPipeline:
         vla,
         depth_model=None,
         T: int = 10,
-        lr: float = 1.0,
+        lr: float = 5.0,
         alpha_loss: float = 400.0,
         layer_start: int = 14,
         layer_end: int = 26,
@@ -214,8 +214,9 @@ class ControlMLLMVLAPipeline:
         vanishing gradients. We re-scale attention with temperature to soften
         the distribution, making it easier for gradient to redistribute attention.
 
-        Loss = alpha * (1 - activation_value)^2
+        Loss = -alpha * log(activation_value)
         where activation_value = sum(softmax(attn/T) * mask)
+        Gradient = -alpha / activation → much stronger when activation is small
         """
         device = mask.device
 
@@ -257,8 +258,10 @@ class ControlMLLMVLAPipeline:
         # Activation: fraction of rescaled attention inside mask
         activation = (attn_rescaled * mask_padded).sum(dim=-1)
 
-        # Loss: push activation toward 1.0
-        loss = self.alpha_loss * ((1.0 - activation) ** 2).mean()
+        # Negative log loss: gradient = -alpha/activation
+        # When activation is small (~0.01), gradient is ~100x stronger than MSE
+        # This drives the optimizer much harder to push attention into the mask
+        loss = -self.alpha_loss * torch.log(activation.clamp(min=1e-8)).mean()
 
         return loss
 

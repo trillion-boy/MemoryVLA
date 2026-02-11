@@ -227,7 +227,8 @@ class ControlMLLMVLAPipeline:
                                     mask_grid[r, c] = 1.0
 
         # --- Fallback: if nothing found, use last good mask or center ---
-        if mask_grid.sum() == 0:
+        detection_success = mask_grid.sum() > 0
+        if not detection_success:
             if self._last_good_mask is not None:
                 print("    WARNING: No depth anomaly found, reusing last known mask")
                 mask_grid = self._last_good_mask.copy()
@@ -281,7 +282,7 @@ class ControlMLLMVLAPipeline:
         else:
             mask_tensor = torch.ones_like(mask_tensor) / mask_tensor.numel()
 
-        return mask_tensor.unsqueeze(0)  # [1, 256]
+        return mask_tensor.unsqueeze(0), detection_success  # [1, 256], bool
 
     # ================================================================
     # Attention Loss (ControlMLLM)
@@ -449,13 +450,14 @@ class ControlMLLMVLAPipeline:
         model_dtype = next(self.vla.parameters()).dtype
         device = self.vlm.device
 
-        # 1. Create spatial mask from depth — FREEZE after first computation
+        # 1. Create spatial mask from depth — FREEZE after first SUCCESSFUL detection
         # Rationale: the cube is stationary; re-computing mask as arm moves
         # causes instability (9↔45 patches). Step 1 has cleanest view.
+        # But: only freeze if detection actually found the cube (not fallback).
         if self._frozen_mask is not None:
             mask = self._frozen_mask.to(device)
             n_active = (mask > 0).sum().item()
-            print(f"    Mask: {n_active}/256 active patches (frozen from step 1)")
+            print(f"    Mask: {n_active}/256 active patches (frozen)")
         else:
             mask_debug_path = None
             if debug_save_dir:
@@ -464,16 +466,20 @@ class ControlMLLMVLAPipeline:
                     debug_save_dir, f"mask_step_{self._step_count:03d}.png"
                 )
             rgb_np = np.array(image)
-            mask = self.create_spatial_mask(
+            mask, detected = self.create_spatial_mask(
                 depth_map, debug_save_path=mask_debug_path,
                 rgb_image=rgb_np,
-            )  # [1, 256]
+            )  # [1, 256], bool
             mask = mask.to(device)
 
-            # Freeze this mask for the rest of the episode
-            self._frozen_mask = mask.clone()
             n_active = (mask > 0).sum().item()
-            print(f"    Mask: {n_active}/256 active patches (computed & frozen)")
+            if detected:
+                # Freeze — cube found, no need to re-detect
+                self._frozen_mask = mask.clone()
+                print(f"    Mask: {n_active}/256 active patches (detected & frozen)")
+            else:
+                # Don't freeze — will retry detection at next optimize step
+                print(f"    Mask: {n_active}/256 active patches (fallback, will retry)")
 
         # 2. Get base embeddings
         base_embeddings, n_image_tokens, _ = self._get_embeddings(image, instruction)
@@ -676,10 +682,10 @@ class ControlMLLMVLAPipeline:
         if depth is None:
             depth = np.zeros(rgb.shape[:2], dtype=np.float32)
 
-        # Create mask with debug
+        # Create mask with debug (ignore detection_success flag here)
         self.create_spatial_mask(
             depth, debug_save_path=save_path, rgb_image=rgb
-        )
+        )[0]  # unpack tuple, only need mask
         print(f"Debug visualization saved to: {save_path}")
 
     # ================================================================

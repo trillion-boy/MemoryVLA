@@ -2,7 +2,7 @@
 Pure MemoryVLA baseline evaluation on ManiSkill2 PickCube.
 
 No ControlMLLM, no depth model, no visual prompt optimization.
-Just MemoryVLA + proper action conversion (LIBERO → ManiSkill2 format).
+MemoryVLA + action conversion + AdaptiveEnsembler (from original repo).
 
 Usage (Colab):
     from evaluation.maniskill2.eval_pickcube_baseline import run_baseline
@@ -22,6 +22,8 @@ import os
 from datetime import datetime
 from typing import Dict, Any
 from transforms3d.euler import euler2axangle
+
+from evaluation.simpler_env.adaptive_ensemble import AdaptiveEnsembler
 
 
 TASK_INSTRUCTION = (
@@ -76,10 +78,13 @@ def run_baseline(
     cfg_scale: float = 1.5,
     save_videos: bool = True,
     sensor_resolution: int = 128,
+    action_ensemble: bool = True,
+    action_ensemble_horizon: int = 7,
+    adaptive_ensemble_alpha: float = 0.1,
 ) -> Dict[str, Any]:
     """
     Pure MemoryVLA baseline. No depth, no ControlMLLM, no pipeline.
-    Only action format conversion (euler→axis-angle, gripper normalization).
+    Action conversion + AdaptiveEnsembler (from original MemoryVLA repo).
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -96,13 +101,24 @@ def run_baseline(
         ),
     )
 
+    # Action ensemble (from original MemoryVLA repo: simpler_env/adaptive_ensemble.py)
+    ensembler = None
+    if action_ensemble:
+        ensembler = AdaptiveEnsembler(
+            pred_action_horizon=action_ensemble_horizon,
+            adaptive_ensemble_alpha=adaptive_ensemble_alpha,
+        )
+
+    ensemble_str = f"ON (horizon={action_ensemble_horizon}, alpha={adaptive_ensemble_alpha})" if action_ensemble else "OFF"
+
     print(f"\n{'='*60}")
-    print(f"PURE BASELINE: MemoryVLA only (no depth, no ControlMLLM)")
+    print(f"PURE BASELINE: MemoryVLA + action conversion + ensemble")
     print(f"{'='*60}")
     print(f"Task: {task_instruction}")
     print(f"Trials: {num_trials}, Max steps: {max_steps}")
     print(f"unnorm_key: {unnorm_key}")
     print(f"Action conversion: euler→axis-angle + gripper [-1,+1]")
+    print(f"Action ensemble: {ensemble_str}")
     print(f"{'='*60}\n")
 
     results = []
@@ -111,6 +127,10 @@ def run_baseline(
         obs, _ = env.reset()
         frames = []
         total_reward = 0.0
+
+        # Reset ensemble for each trial
+        if ensembler is not None:
+            ensembler.reset()
 
         for step in range(max_steps):
             rgb = get_rgb_from_obs(obs)
@@ -130,6 +150,11 @@ def run_baseline(
             )
 
             raw_action = actions[0]
+
+            # Apply action ensemble before format conversion
+            if ensembler is not None:
+                raw_action = ensembler.ensemble_action(raw_action)
+
             action = convert_action_to_maniskill2(raw_action)
             obs, reward, terminated, truncated, info = env.step(
                 torch.tensor(action).unsqueeze(0)
@@ -180,7 +205,7 @@ def run_baseline(
     avg_reward = np.mean([r["total_reward"] for r in results])
 
     print(f"\n{'='*60}")
-    print(f"PURE BASELINE Summary")
+    print(f"PURE BASELINE Summary (ensemble={action_ensemble})")
     print(f"{'='*60}")
     print(f"Success Rate: {total_success}/{num_trials} ({100*total_success/num_trials:.1f}%)")
     print(f"Avg Reward:   {avg_reward:.3f}")
@@ -188,6 +213,7 @@ def run_baseline(
 
     return {
         "pipeline": "PURE_BASELINE",
+        "action_ensemble": action_ensemble,
         "success_rate": 100 * total_success / num_trials,
         "avg_reward": avg_reward,
         "results": results,

@@ -83,6 +83,8 @@ class ControlMLLMVLAPipeline:
         self._visual_prompt = None
         self._hook_handle = None
         self._step_count = 0
+        self._frozen_mask = None       # Mask computed at step 1, reused throughout
+        self._last_good_mask = None    # Last successfully detected mask (fallback)
 
     # ================================================================
     # Depth → Spatial Mask
@@ -224,12 +226,19 @@ class ControlMLLMVLAPipeline:
                                 if 0 <= r < grid_h and 0 <= c < grid_w:
                                     mask_grid[r, c] = 1.0
 
-        # --- Fallback: if nothing found, use center region ---
+        # --- Fallback: if nothing found, use last good mask or center ---
         if mask_grid.sum() == 0:
-            print("    WARNING: No small depth anomaly found, using center fallback")
-            for i in range(grid_h // 2 - 1, grid_h // 2 + 2):
-                for j in range(grid_w // 2 - 1, grid_w // 2 + 2):
-                    mask_grid[i, j] = 1.0
+            if self._last_good_mask is not None:
+                print("    WARNING: No depth anomaly found, reusing last known mask")
+                mask_grid = self._last_good_mask.copy()
+            else:
+                print("    WARNING: No depth anomaly found and no prior mask, using center fallback")
+                for i in range(grid_h // 2 - 1, grid_h // 2 + 2):
+                    for j in range(grid_w // 2 - 1, grid_w // 2 + 2):
+                        mask_grid[i, j] = 1.0
+        else:
+            # Store this as last good mask for future fallback
+            self._last_good_mask = mask_grid.copy()
 
         # --- Debug visualization ---
         if debug_save_path:
@@ -440,23 +449,31 @@ class ControlMLLMVLAPipeline:
         model_dtype = next(self.vla.parameters()).dtype
         device = self.vlm.device
 
-        # 1. Create spatial mask from depth (with CCA filtering)
-        mask_debug_path = None
-        if debug_save_dir:
-            os.makedirs(debug_save_dir, exist_ok=True)
-            mask_debug_path = os.path.join(
-                debug_save_dir, f"mask_step_{self._step_count:03d}.png"
-            )
-        rgb_np = np.array(image)
-        mask = self.create_spatial_mask(
-            depth_map, debug_save_path=mask_debug_path,
-            rgb_image=rgb_np,
-        )  # [1, 256]
-        mask = mask.to(device)
+        # 1. Create spatial mask from depth — FREEZE after first computation
+        # Rationale: the cube is stationary; re-computing mask as arm moves
+        # causes instability (9↔45 patches). Step 1 has cleanest view.
+        if self._frozen_mask is not None:
+            mask = self._frozen_mask.to(device)
+            n_active = (mask > 0).sum().item()
+            print(f"    Mask: {n_active}/256 active patches (frozen from step 1)")
+        else:
+            mask_debug_path = None
+            if debug_save_dir:
+                os.makedirs(debug_save_dir, exist_ok=True)
+                mask_debug_path = os.path.join(
+                    debug_save_dir, f"mask_step_{self._step_count:03d}.png"
+                )
+            rgb_np = np.array(image)
+            mask = self.create_spatial_mask(
+                depth_map, debug_save_path=mask_debug_path,
+                rgb_image=rgb_np,
+            )  # [1, 256]
+            mask = mask.to(device)
 
-        # Log mask stats
-        n_active = (mask > 0).sum().item()
-        print(f"    Mask: {n_active}/256 active patches")
+            # Freeze this mask for the rest of the episode
+            self._frozen_mask = mask.clone()
+            n_active = (mask > 0).sum().item()
+            print(f"    Mask: {n_active}/256 active patches (computed & frozen)")
 
         # 2. Get base embeddings
         base_embeddings, n_image_tokens, _ = self._get_embeddings(image, instruction)
@@ -642,6 +659,8 @@ class ControlMLLMVLAPipeline:
         """Reset state for new episode."""
         self._visual_prompt = None
         self._step_count = 0
+        self._frozen_mask = None
+        self._last_good_mask = None
 
     def debug_first_frame(
         self,

@@ -78,6 +78,7 @@ def run_evaluation(
     optimizer: str = "sgd",
     init_scale: float = 0.05,
     sensor_resolution: int = 128,
+    baseline_mode: bool = False,
 ) -> Dict[str, Any]:
     """
     Run PickCube evaluation with ControlMLLM visual prompt optimization.
@@ -137,22 +138,27 @@ def run_evaluation(
         ),
     )
 
+    mode_name = "BASELINE (no ControlMLLM)" if baseline_mode else "ControlMLLM-VLA"
+
     if verbose:
         print(f"\n{'='*60}")
-        print(f"ControlMLLM-VLA Evaluation: PickCube-v1")
+        print(f"{mode_name} Evaluation: PickCube-v1")
         print(f"{'='*60}")
         print(f"Task: {task_instruction}")
         print(f"Trials: {num_trials}, Max steps: {max_steps}")
         print(f"Depth source: {depth_source}")
         print(f"Resolution: {sensor_resolution}x{sensor_resolution}")
-        print(f"{'='*60}")
-        print(f"ControlMLLM Config:")
-        print(f"  T (iterations):    {T}")
-        print(f"  lr:                {lr}")
-        print(f"  alpha_loss:        {alpha_loss}")
-        print(f"  Layers:            {layer_start}-{layer_end}")
-        print(f"  Optimizer:         {optimizer}")
-        print(f"  Optimize freq:     every {optimize_freq} step(s)")
+        if baseline_mode:
+            print(f"MODE: BASELINE — no visual prompt optimization")
+        else:
+            print(f"{'='*60}")
+            print(f"ControlMLLM Config:")
+            print(f"  T (iterations):    {T}")
+            print(f"  lr:                {lr}")
+            print(f"  alpha_loss:        {alpha_loss}")
+            print(f"  Layers:            {layer_start}-{layer_end}")
+            print(f"  Optimizer:         {optimizer}")
+            print(f"  Optimize freq:     every {optimize_freq} step(s)")
         print(f"{'='*60}\n")
 
     results = []
@@ -185,22 +191,34 @@ def run_evaluation(
                 )
                 pipeline.debug_first_frame(pil_image, save_path=frame_debug_path)
 
-            # Only save debug masks for first 5 steps of first trial
-            step_debug_dir = None
-            if trial_debug_dir and step < 5:
-                step_debug_dir = trial_debug_dir
+            if baseline_mode:
+                # Baseline: run MemoryVLA directly, no Pv optimization
+                actions, _ = vla.predict_action(
+                    image=pil_image,
+                    instruction=task_instruction,
+                    unnorm_key=unnorm_key,
+                    cfg_scale=cfg_scale,
+                    use_ddim=True,
+                    num_ddim_steps=10,
+                    episode_first_frame=episode_first,
+                )
+            else:
+                # ControlMLLM: optimize visual prompt then predict
+                step_debug_dir = None
+                if trial_debug_dir and step < 5:
+                    step_debug_dir = trial_debug_dir
 
-            actions, _ = pipeline.predict_action(
-                image=pil_image,
-                instruction=task_instruction,
-                obs=obs,
-                unnorm_key=unnorm_key,
-                cfg_scale=cfg_scale,
-                use_ddim=True,
-                num_ddim_steps=10,
-                episode_first_frame=episode_first,
-                debug_save_dir=step_debug_dir,
-            )
+                actions, _ = pipeline.predict_action(
+                    image=pil_image,
+                    instruction=task_instruction,
+                    obs=obs,
+                    unnorm_key=unnorm_key,
+                    cfg_scale=cfg_scale,
+                    use_ddim=True,
+                    num_ddim_steps=10,
+                    episode_first_frame=episode_first,
+                    debug_save_dir=step_debug_dir,
+                )
 
             action = actions[0]
             obs, reward, terminated, truncated, info = env.step(
@@ -259,7 +277,7 @@ def run_evaluation(
 
     summary = {
         "env_name": "PickCube-v1",
-        "pipeline": "ControlMLLM-VLA",
+        "pipeline": "BASELINE" if baseline_mode else "ControlMLLM-VLA",
         "depth_source": depth_source,
         "optimizer": optimizer,
         "T": T,
@@ -279,7 +297,7 @@ def run_evaluation(
 
     if verbose:
         print(f"\n{'='*60}")
-        print(f"Summary - PickCube (ControlMLLM-VLA)")
+        print(f"Summary - PickCube ({mode_name})")
         print(f"{'='*60}")
         print(f"Success Rate: {total_success}/{num_trials} ({summary['success_rate']:.1f}%)")
         print(f"Avg Reward:   {avg_reward:.3f}")
@@ -290,7 +308,7 @@ def run_evaluation(
     # Save results
     result_file = os.path.join(save_dir, "results.txt")
     with open(result_file, "w") as f:
-        f.write(f"PickCube ControlMLLM-VLA Results - {datetime.now()}\n")
+        f.write(f"PickCube {mode_name} Results - {datetime.now()}\n")
         f.write(f"{'='*60}\n")
         f.write(f"Config: T={T}, lr={lr}, optim={optimizer}, alpha={alpha_loss}, "
                 f"layers={layer_start}-{layer_end}, freq={optimize_freq}\n")

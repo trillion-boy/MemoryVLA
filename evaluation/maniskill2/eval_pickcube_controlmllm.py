@@ -30,6 +30,7 @@ import imageio
 import os
 from datetime import datetime
 from typing import Optional, Dict, Any
+from transforms3d.euler import euler2axangle
 
 from evaluation.maniskill2.controlmllm_vla_pipeline import ControlMLLMVLAPipeline
 
@@ -54,6 +55,32 @@ def get_rgb_from_obs(obs):
                     rgb = (rgb * 255).astype(np.uint8)
                 return rgb
     raise ValueError("No RGB found in obs")
+
+
+def convert_action_to_maniskill2(raw_action: np.ndarray, action_scale: float = 1.0) -> np.ndarray:
+    """
+    Convert MemoryVLA raw action (LIBERO format) to ManiSkill2 format.
+
+    MemoryVLA outputs: [x, y, z, roll, pitch, yaw, gripper]
+      - rotation in euler angles
+      - gripper in [0, 1] (LIBERO convention)
+
+    ManiSkill2 pd_ee_delta_pose expects: [dx, dy, dz, ax, ay, az, gripper]
+      - rotation in axis-angle
+      - gripper in [-1, +1] (-1=close, +1=open)
+    """
+    delta_pos = raw_action[:3] * action_scale
+
+    # Euler (roll, pitch, yaw) → axis-angle
+    roll, pitch, yaw = raw_action[3], raw_action[4], raw_action[5]
+    axis, angle = euler2axangle(roll, pitch, yaw)
+    delta_rot_axangle = axis * angle * action_scale
+
+    # Gripper: LIBERO [0,1] → ManiSkill2 [-1,+1], binarized
+    gripper = raw_action[6]
+    gripper_normalized = 2.0 * (gripper > 0.5) - 1.0
+
+    return np.concatenate([delta_pos, delta_rot_axangle, [gripper_normalized]]).astype(np.float32)
 
 
 def run_evaluation(
@@ -220,7 +247,8 @@ def run_evaluation(
                     debug_save_dir=step_debug_dir,
                 )
 
-            action = actions[0]
+            raw_action = actions[0]
+            action = convert_action_to_maniskill2(raw_action)
             obs, reward, terminated, truncated, info = env.step(
                 torch.tensor(action).unsqueeze(0)
             )

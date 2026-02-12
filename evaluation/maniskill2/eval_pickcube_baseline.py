@@ -80,17 +80,29 @@ def detect_cube_from_depth(
     Detect cube pixel position from depth map using 2-phase CCA.
 
     Returns (cx, cy) centroid in pixel coordinates, or None if not found.
-    Uses progressive thresholds: tries strict first, then relaxes.
+    Uses progressive thresholds with background masking and center-proximity scoring.
     """
     depth = depth_map.astype(np.float32)
     h, w = depth.shape[:2]
+
+    # === Mask background (sky) ===
+    # DA V2 relative depth: far = low values (sky), close = high values (table, arm)
+    # Mask out the far background to avoid sky-table boundary artifacts
+    depth_p20 = np.percentile(depth, 20)
+    bg_mask = (depth < depth_p20).astype(np.uint8)
+    bg_mask = cv2.dilate(bg_mask, np.ones((11, 11), np.uint8))
 
     # Smooth background estimate
     smooth = cv2.GaussianBlur(depth, (31, 31), 0)
     abs_deviation = np.abs(smooth - depth)
 
+    # Zero out background region in deviation
+    abs_deviation[bg_mask > 0] = 0
+
     if debug:
-        print(f"    [depth] shape={depth.shape}, dev mean={abs_deviation.mean():.4f}, std={abs_deviation.std():.4f}, max={abs_deviation.max():.4f}")
+        bg_pct = 100 * bg_mask.sum() / (h * w)
+        print(f"    [depth] shape={depth.shape}, dev mean={abs_deviation.mean():.4f}, "
+              f"std={abs_deviation.std():.4f}, max={abs_deviation.max():.4f}, bg_masked={bg_pct:.0f}%")
 
     # Phase 1: Find and remove robot arm (largest anomaly)
     phase1_thr = abs_deviation.mean() + abs_deviation.std() * 1.0
@@ -108,52 +120,69 @@ def detect_cube_from_depth(
         if debug:
             print(f"    [phase1] arm area={areas_p1[arm_label-1]}, total components={num_labels_p1-1}")
 
+    # Combine exclusion mask: background + arm
+    exclude_mask = np.maximum(bg_mask, arm_mask)
+
     # Phase 2: Detect small objects on table with progressive thresholds
     table_deviation = abs_deviation.copy()
-    table_deviation[arm_mask > 0] = 0
+    table_deviation[exclude_mask > 0] = 0
 
-    table_valid = abs_deviation[arm_mask == 0]
+    table_valid = abs_deviation[exclude_mask == 0]
     if table_valid.size == 0 or table_valid.std() < 1e-6:
         if debug:
             print(f"    [phase2] FAIL: table_valid empty or zero std")
         return None
+
+    center_x, center_y = w / 2.0, h / 2.0
+    max_dist = np.sqrt(center_x**2 + center_y**2)
 
     # Try progressively lower thresholds: 2.0, 1.5, 1.0, 0.5
     for multiplier in [2.0, 1.5, 1.0, 0.5]:
         phase2_thr = table_valid.mean() + table_valid.std() * multiplier
 
         target_candidates = (
-            (table_deviation > phase2_thr) & (arm_mask == 0)
+            (table_deviation > phase2_thr) & (exclude_mask == 0)
         ).astype(np.uint8)
 
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
             target_candidates, connectivity=8
         )
 
-        # Find small components (cube-sized: 1-200 pixels)
+        # Score components: prefer small, center-close ones
         best_component = None
-        best_area = 0
-        all_areas = []
+        best_score = -1
+        all_info = []
         for label_id in range(1, num_labels):
             area = stats[label_id, cv2.CC_STAT_AREA]
-            all_areas.append(area)
-            if 1 <= area <= 200 and area > best_area:
-                best_area = area
+            if area < 1 or area > 300:
+                continue
+            cx, cy = centroids[label_id]
+            dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+            # Score: closer to center = better (0~1), penalize very large areas
+            proximity = 1.0 - (dist / max_dist)
+            score = proximity
+            all_info.append((label_id, area, cx, cy, dist, score))
+            if score > best_score:
+                best_score = score
                 best_component = label_id
 
         if debug:
+            areas = [info[1] for info in all_info]
             print(f"    [phase2] thr_mult={multiplier:.1f}, thr={phase2_thr:.4f}, "
-                  f"components={num_labels-1}, areas={sorted(all_areas, reverse=True)[:5]}")
+                  f"candidates={len(all_info)}, areas={sorted(areas, reverse=True)[:5]}")
+            for info in sorted(all_info, key=lambda x: -x[5])[:3]:
+                lid, a, cx, cy, d, s = info
+                print(f"      comp {lid}: area={a}, pos=({cx:.1f},{cy:.1f}), dist={d:.1f}, score={s:.2f}")
 
         if best_component is not None:
             cx = centroids[best_component][0]
             cy = centroids[best_component][1]
             if debug:
-                print(f"    [phase2] FOUND: centroid=({cx:.1f}, {cy:.1f}), area={best_area}")
+                print(f"    [phase2] SELECTED: centroid=({cx:.1f}, {cy:.1f}), score={best_score:.2f}")
             return (cx, cy)
 
     if debug:
-        print(f"    [phase2] FAIL: no component in size range [1, 200] at any threshold")
+        print(f"    [phase2] FAIL: no component found at any threshold")
     return None
 
 

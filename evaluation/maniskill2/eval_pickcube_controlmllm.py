@@ -104,7 +104,7 @@ def run_evaluation(
     optimize_freq: int = 5,
     optimizer: str = "sgd",
     init_scale: float = 0.05,
-    sensor_resolution: int = 128,
+    sensor_resolution: int = 224,
     baseline_mode: bool = False,
 ) -> Dict[str, Any]:
     """

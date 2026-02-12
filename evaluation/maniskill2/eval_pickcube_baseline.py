@@ -72,19 +72,25 @@ def convert_action_to_maniskill2(raw_action: np.ndarray, action_scale: float = 1
     return np.concatenate([delta_pos, delta_rot_axangle, [gripper_normalized]]).astype(np.float32)
 
 
-def detect_cube_from_depth(depth_map: np.ndarray) -> Optional[Tuple[float, float]]:
+def detect_cube_from_depth(
+    depth_map: np.ndarray,
+    debug: bool = False,
+) -> Optional[Tuple[float, float]]:
     """
     Detect cube pixel position from depth map using 2-phase CCA.
 
     Returns (cx, cy) centroid in pixel coordinates, or None if not found.
-    Same approach as controlmllm_vla_pipeline.create_spatial_mask but
-    returns centroid instead of grid mask.
+    Uses progressive thresholds: tries strict first, then relaxes.
     """
     depth = depth_map.astype(np.float32)
+    h, w = depth.shape[:2]
 
     # Smooth background estimate
     smooth = cv2.GaussianBlur(depth, (31, 31), 0)
     abs_deviation = np.abs(smooth - depth)
+
+    if debug:
+        print(f"    [depth] shape={depth.shape}, dev mean={abs_deviation.mean():.4f}, std={abs_deviation.std():.4f}, max={abs_deviation.max():.4f}")
 
     # Phase 1: Find and remove robot arm (largest anomaly)
     phase1_thr = abs_deviation.mean() + abs_deviation.std() * 1.0
@@ -99,40 +105,55 @@ def detect_cube_from_depth(depth_map: np.ndarray) -> Optional[Tuple[float, float
         arm_label = int(np.argmax(areas_p1)) + 1
         arm_mask = (labels_p1 == arm_label).astype(np.uint8)
         arm_mask = cv2.dilate(arm_mask, np.ones((15, 15), np.uint8))
+        if debug:
+            print(f"    [phase1] arm area={areas_p1[arm_label-1]}, total components={num_labels_p1-1}")
 
-    # Phase 2: Detect small objects on table
+    # Phase 2: Detect small objects on table with progressive thresholds
     table_deviation = abs_deviation.copy()
     table_deviation[arm_mask > 0] = 0
 
     table_valid = abs_deviation[arm_mask == 0]
-    if table_valid.size > 0 and table_valid.std() > 1e-6:
-        phase2_thr = table_valid.mean() + table_valid.std() * 2.0
-        phase2_thr = max(phase2_thr, table_valid.std() * 1.0)
-    else:
+    if table_valid.size == 0 or table_valid.std() < 1e-6:
+        if debug:
+            print(f"    [phase2] FAIL: table_valid empty or zero std")
         return None
 
-    target_candidates = (
-        (table_deviation > phase2_thr) & (arm_mask == 0)
-    ).astype(np.uint8)
+    # Try progressively lower thresholds: 2.0, 1.5, 1.0, 0.5
+    for multiplier in [2.0, 1.5, 1.0, 0.5]:
+        phase2_thr = table_valid.mean() + table_valid.std() * multiplier
 
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        target_candidates, connectivity=8
-    )
+        target_candidates = (
+            (table_deviation > phase2_thr) & (arm_mask == 0)
+        ).astype(np.uint8)
 
-    # Find small components (cube-sized: 2-80 pixels)
-    best_component = None
-    best_area = 0
-    for label_id in range(1, num_labels):
-        area = stats[label_id, cv2.CC_STAT_AREA]
-        if 2 <= area <= 80 and area > best_area:
-            best_area = area
-            best_component = label_id
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            target_candidates, connectivity=8
+        )
 
-    if best_component is not None:
-        cx = centroids[best_component][0]
-        cy = centroids[best_component][1]
-        return (cx, cy)
+        # Find small components (cube-sized: 1-200 pixels)
+        best_component = None
+        best_area = 0
+        all_areas = []
+        for label_id in range(1, num_labels):
+            area = stats[label_id, cv2.CC_STAT_AREA]
+            all_areas.append(area)
+            if 1 <= area <= 200 and area > best_area:
+                best_area = area
+                best_component = label_id
 
+        if debug:
+            print(f"    [phase2] thr_mult={multiplier:.1f}, thr={phase2_thr:.4f}, "
+                  f"components={num_labels-1}, areas={sorted(all_areas, reverse=True)[:5]}")
+
+        if best_component is not None:
+            cx = centroids[best_component][0]
+            cy = centroids[best_component][1]
+            if debug:
+                print(f"    [phase2] FOUND: centroid=({cx:.1f}, {cy:.1f}), area={best_area}")
+            return (cx, cy)
+
+    if debug:
+        print(f"    [phase2] FAIL: no component in size range [1, 200] at any threshold")
     return None
 
 
@@ -292,12 +313,23 @@ def run_baseline(
                         result = depth_model(pil_image)
                         depth_map = np.array(result["depth"]).astype(np.float32)
 
-                    cube_pos = detect_cube_from_depth(depth_map)
+                    # Debug on first attempt of each trial
+                    is_first_attempt = (step == 0)
+                    cube_pos = detect_cube_from_depth(depth_map, debug=is_first_attempt)
                     if cube_pos is not None:
                         cached_cube_pos = cube_pos
                         cube_detected_count += 1
-                        if step == 0:
-                            print(f"  Trial {trial+1}: Cube detected at pixel ({cube_pos[0]:.1f}, {cube_pos[1]:.1f})")
+                        print(f"  Trial {trial+1} step {step}: Cube detected at pixel ({cube_pos[0]:.1f}, {cube_pos[1]:.1f})")
+
+                    # Save depth map for debugging on first step
+                    if is_first_attempt:
+                        depth_debug_path = os.path.join(save_dir, f"trial_{trial:02d}_depth.npy")
+                        np.save(depth_debug_path, depth_map)
+                        # Also save depth as visual image
+                        d_norm = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
+                        depth_vis = (d_norm * 255).astype(np.uint8)
+                        depth_vis_path = os.path.join(save_dir, f"trial_{trial:02d}_depth.png")
+                        Image.fromarray(depth_vis).save(depth_vis_path)
 
                 # Apply correction if cube was found
                 if cached_cube_pos is not None:

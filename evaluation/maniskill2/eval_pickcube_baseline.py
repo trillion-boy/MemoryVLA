@@ -1,16 +1,16 @@
 """
-MemoryVLA baseline + Depth-Guided Action Correction on ManiSkill2 PickCube.
+MemoryVLA baseline + Action Correction on ManiSkill2 PickCube.
 
-Depth Action Correction: DA V2 depth → detect cube position → compute
-correction vector → add to MemoryVLA action. Training-free, plug-and-play.
+Action Correction: RGB → detect cube via HSV color → pixel offset from center
+→ correction vector → add to MemoryVLA action. Training-free, plug-and-play.
 
 Usage (Colab):
     from evaluation.maniskill2.eval_pickcube_baseline import run_baseline
-    # Pure baseline (no depth)
+    # Pure baseline
     results = run_baseline(vla, save_dir="/content/eval_baseline")
-    # With depth action correction
-    results = run_baseline(vla, depth_model=depth_model,
-        depth_correction=True, save_dir="/content/eval_depth_correction")
+    # With action correction
+    results = run_baseline(vla, depth_correction=True,
+        correction_scale=0.01, save_dir="/content/eval_correction")
 """
 
 import cv2
@@ -72,117 +72,77 @@ def convert_action_to_maniskill2(raw_action: np.ndarray, action_scale: float = 1
     return np.concatenate([delta_pos, delta_rot_axangle, [gripper_normalized]]).astype(np.float32)
 
 
-def detect_cube_from_depth(
-    depth_map: np.ndarray,
+def detect_cube_from_rgb(
+    rgb: np.ndarray,
     debug: bool = False,
 ) -> Optional[Tuple[float, float]]:
     """
-    Detect cube pixel position from depth map using 2-phase CCA.
+    Detect cube pixel position from RGB image using HSV color filtering.
+
+    The cube in ManiSkill2 is a distinctive color (red/green/blue).
+    Uses HSV thresholding + CCA to find small colored objects on the table.
 
     Returns (cx, cy) centroid in pixel coordinates, or None if not found.
-    Uses progressive thresholds with background masking and center-proximity scoring.
     """
-    depth = depth_map.astype(np.float32)
-    h, w = depth.shape[:2]
+    h, w = rgb.shape[:2]
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
 
-    # === Mask background (sky) ===
-    # DA V2 relative depth: far = low values (sky), close = high values (table, arm)
-    # Mask out the far background to avoid sky-table boundary artifacts
-    depth_p20 = np.percentile(depth, 20)
-    bg_mask = (depth < depth_p20).astype(np.uint8)
-    bg_mask = cv2.dilate(bg_mask, np.ones((11, 11), np.uint8))
+    # Detect red: H wraps around 0/180, so need two ranges
+    mask_red1 = cv2.inRange(hsv, np.array([0, 80, 80]), np.array([10, 255, 255]))
+    mask_red2 = cv2.inRange(hsv, np.array([170, 80, 80]), np.array([180, 255, 255]))
+    # Also detect green and blue cubes (ManiSkill2 can randomize)
+    mask_green = cv2.inRange(hsv, np.array([35, 80, 80]), np.array([85, 255, 255]))
+    mask_blue = cv2.inRange(hsv, np.array([100, 80, 80]), np.array([130, 255, 255]))
 
-    # Smooth background estimate
-    smooth = cv2.GaussianBlur(depth, (31, 31), 0)
-    abs_deviation = np.abs(smooth - depth)
+    color_mask = mask_red1 | mask_red2 | mask_green | mask_blue
 
-    # Zero out background region in deviation
-    abs_deviation[bg_mask > 0] = 0
+    # Clean up noise
+    kernel = np.ones((3, 3), np.uint8)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_OPEN, kernel)
+    color_mask = cv2.morphologyEx(color_mask, cv2.MORPH_CLOSE, kernel)
 
-    if debug:
-        bg_pct = 100 * bg_mask.sum() / (h * w)
-        print(f"    [depth] shape={depth.shape}, dev mean={abs_deviation.mean():.4f}, "
-              f"std={abs_deviation.std():.4f}, max={abs_deviation.max():.4f}, bg_masked={bg_pct:.0f}%")
-
-    # Phase 1: Find and remove robot arm (largest anomaly)
-    phase1_thr = abs_deviation.mean() + abs_deviation.std() * 1.0
-    phase1_mask = (abs_deviation > phase1_thr).astype(np.uint8)
-
-    num_labels_p1, labels_p1, stats_p1, _ = cv2.connectedComponentsWithStats(
-        phase1_mask, connectivity=8
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        color_mask, connectivity=8
     )
-    arm_mask = np.zeros_like(phase1_mask)
-    if num_labels_p1 > 1:
-        areas_p1 = stats_p1[1:, cv2.CC_STAT_AREA]
-        arm_label = int(np.argmax(areas_p1)) + 1
-        arm_mask = (labels_p1 == arm_label).astype(np.uint8)
-        arm_mask = cv2.dilate(arm_mask, np.ones((15, 15), np.uint8))
-        if debug:
-            print(f"    [phase1] arm area={areas_p1[arm_label-1]}, total components={num_labels_p1-1}")
-
-    # Combine exclusion mask: background + arm
-    exclude_mask = np.maximum(bg_mask, arm_mask)
-
-    # Phase 2: Detect small objects on table with progressive thresholds
-    table_deviation = abs_deviation.copy()
-    table_deviation[exclude_mask > 0] = 0
-
-    table_valid = abs_deviation[exclude_mask == 0]
-    if table_valid.size == 0 or table_valid.std() < 1e-6:
-        if debug:
-            print(f"    [phase2] FAIL: table_valid empty or zero std")
-        return None
-
-    center_x, center_y = w / 2.0, h / 2.0
-    max_dist = np.sqrt(center_x**2 + center_y**2)
-
-    # Try progressively lower thresholds: 2.0, 1.5, 1.0, 0.5
-    for multiplier in [2.0, 1.5, 1.0, 0.5]:
-        phase2_thr = table_valid.mean() + table_valid.std() * multiplier
-
-        target_candidates = (
-            (table_deviation > phase2_thr) & (exclude_mask == 0)
-        ).astype(np.uint8)
-
-        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            target_candidates, connectivity=8
-        )
-
-        # Score components: prefer small, center-close ones
-        best_component = None
-        best_score = -1
-        all_info = []
-        for label_id in range(1, num_labels):
-            area = stats[label_id, cv2.CC_STAT_AREA]
-            if area < 1 or area > 300:
-                continue
-            cx, cy = centroids[label_id]
-            dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
-            # Score: closer to center = better (0~1), penalize very large areas
-            proximity = 1.0 - (dist / max_dist)
-            score = proximity
-            all_info.append((label_id, area, cx, cy, dist, score))
-            if score > best_score:
-                best_score = score
-                best_component = label_id
-
-        if debug:
-            areas = [info[1] for info in all_info]
-            print(f"    [phase2] thr_mult={multiplier:.1f}, thr={phase2_thr:.4f}, "
-                  f"candidates={len(all_info)}, areas={sorted(areas, reverse=True)[:5]}")
-            for info in sorted(all_info, key=lambda x: -x[5])[:3]:
-                lid, a, cx, cy, d, s = info
-                print(f"      comp {lid}: area={a}, pos=({cx:.1f},{cy:.1f}), dist={d:.1f}, score={s:.2f}")
-
-        if best_component is not None:
-            cx = centroids[best_component][0]
-            cy = centroids[best_component][1]
-            if debug:
-                print(f"    [phase2] SELECTED: centroid=({cx:.1f}, {cy:.1f}), score={best_score:.2f}")
-            return (cx, cy)
 
     if debug:
-        print(f"    [phase2] FAIL: no component found at any threshold")
+        total_colored = color_mask.sum() // 255
+        print(f"    [rgb] shape={rgb.shape}, colored_pixels={total_colored}, components={num_labels-1}")
+
+    # Find the best component: small enough to be a cube (not the robot or background)
+    # Cube is typically 3-500 pixels depending on resolution
+    center_x, center_y = w / 2.0, h / 2.0
+    best_component = None
+    best_score = -1
+
+    for label_id in range(1, num_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if area < 3 or area > 2000:
+            continue
+        cx, cy = centroids[label_id]
+
+        # Prefer components in the lower half (table area, not robot/sky)
+        table_bonus = 1.0 if cy > h * 0.35 else 0.3
+        score = area * table_bonus
+
+        if debug:
+            print(f"      comp {label_id}: area={area}, pos=({cx:.1f},{cy:.1f}), "
+                  f"table_bonus={table_bonus:.1f}, score={score:.0f}")
+
+        if score > best_score:
+            best_score = score
+            best_component = label_id
+
+    if best_component is not None:
+        cx = centroids[best_component][0]
+        cy = centroids[best_component][1]
+        if debug:
+            area = stats[best_component, cv2.CC_STAT_AREA]
+            print(f"    [rgb] FOUND: centroid=({cx:.1f}, {cy:.1f}), area={area}")
+        return (cx, cy)
+
+    if debug:
+        print(f"    [rgb] FAIL: no colored component found")
     return None
 
 
@@ -233,7 +193,7 @@ def run_baseline(
     save_dir: str = "/content/eval_pure_baseline",
     cfg_scale: float = 1.5,
     save_videos: bool = True,
-    sensor_resolution: int = 128,
+    sensor_resolution: int = 224,
     # Action ensemble
     action_ensemble: bool = True,
     action_ensemble_horizon: int = 7,
@@ -243,11 +203,13 @@ def run_baseline(
     correction_scale: float = 0.005,
 ) -> Dict[str, Any]:
     """
-    MemoryVLA baseline with optional depth-guided action correction.
+    MemoryVLA baseline with optional action correction.
+
+    Cube detection uses RGB color filtering (HSV), NOT depth.
+    DA V2 depth_model is optional and not used for detection.
 
     Args:
-        depth_model: DA V2 model (required if depth_correction=True)
-        depth_correction: Enable depth-guided action correction
+        depth_correction: Enable action correction based on cube position
         correction_scale: Strength of correction (tune this!)
     """
     os.makedirs(save_dir, exist_ok=True)
@@ -329,57 +291,32 @@ def run_baseline(
 
             action = convert_action_to_maniskill2(raw_action)
 
-            # Depth-guided action correction
-            if depth_correction and depth_model is not None:
+            # Action correction: detect cube from RGB, compute correction
+            if depth_correction:
                 cube_total_steps += 1
 
-                # Detect cube (use cache if available)
+                # Detect cube from RGB (use cache if available)
                 if cached_cube_pos is None:
                     rgb_np = np.array(pil_image)
-                    if hasattr(depth_model, 'infer_image'):
-                        depth_map = depth_model.infer_image(rgb_np)
-                    else:
-                        result = depth_model(pil_image)
-                        depth_map = np.array(result["depth"]).astype(np.float32)
-
-                    # Debug on first attempt of each trial
                     is_first_attempt = (step == 0)
-                    cube_pos = detect_cube_from_depth(depth_map, debug=is_first_attempt)
+                    cube_pos = detect_cube_from_rgb(rgb_np, debug=is_first_attempt)
                     if cube_pos is not None:
                         cached_cube_pos = cube_pos
                         cube_detected_count += 1
-                        print(f"  Trial {trial+1} step {step}: Cube detected at pixel ({cube_pos[0]:.1f}, {cube_pos[1]:.1f})")
+                        print(f"  Trial {trial+1} step {step}: Cube at pixel ({cube_pos[0]:.1f}, {cube_pos[1]:.1f})")
 
                     # Save annotated debug image on first step
                     if is_first_attempt:
-                        depth_debug_path = os.path.join(save_dir, f"trial_{trial:02d}_depth.npy")
-                        np.save(depth_debug_path, depth_map)
-
-                        # Create side-by-side: RGB | Depth with detection overlay
-                        d_norm = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
-                        depth_rgb = np.stack([d_norm * 255] * 3, axis=-1).astype(np.uint8)
-
-                        # Draw detected point on both
                         rgb_annotated = rgb_np.copy()
                         if cached_cube_pos is not None:
                             cx_i, cy_i = int(cached_cube_pos[0]), int(cached_cube_pos[1])
-                            # Red cross on RGB
                             cv2.drawMarker(rgb_annotated, (cx_i, cy_i), (255, 0, 0),
-                                           cv2.MARKER_CROSS, 15, 2)
-                            # Red cross on depth
-                            cv2.drawMarker(depth_rgb, (cx_i, cy_i), (255, 0, 0),
-                                           cv2.MARKER_CROSS, 15, 2)
-                            # Blue cross at center
-                            c = sensor_resolution // 2
-                            cv2.drawMarker(rgb_annotated, (c, c), (0, 0, 255),
-                                           cv2.MARKER_CROSS, 10, 1)
-                            cv2.drawMarker(depth_rgb, (c, c), (0, 0, 255),
-                                           cv2.MARKER_CROSS, 10, 1)
-
-                        # Concatenate side by side
-                        combined = np.concatenate([rgb_annotated, depth_rgb], axis=1)
+                                           cv2.MARKER_CROSS, 20, 2)
+                        c = sensor_resolution // 2
+                        cv2.drawMarker(rgb_annotated, (c, c), (0, 0, 255),
+                                       cv2.MARKER_CROSS, 15, 1)
                         debug_path = os.path.join(save_dir, f"trial_{trial:02d}_debug.png")
-                        Image.fromarray(combined).save(debug_path)
+                        Image.fromarray(rgb_annotated).save(debug_path)
                         print(f"  Trial {trial+1}: Debug image saved → {debug_path}")
 
                 # Apply correction if cube was found

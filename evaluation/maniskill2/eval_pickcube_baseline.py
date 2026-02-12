@@ -1,14 +1,19 @@
 """
-Pure MemoryVLA baseline evaluation on ManiSkill2 PickCube.
+MemoryVLA baseline + Depth-Guided Action Correction on ManiSkill2 PickCube.
 
-No ControlMLLM, no depth model, no visual prompt optimization.
-MemoryVLA + action conversion + AdaptiveEnsembler (from original repo).
+Depth Action Correction: DA V2 depth → detect cube position → compute
+correction vector → add to MemoryVLA action. Training-free, plug-and-play.
 
 Usage (Colab):
     from evaluation.maniskill2.eval_pickcube_baseline import run_baseline
-    results = run_baseline(vla, save_dir="/content/eval_pure_baseline")
+    # Pure baseline (no depth)
+    results = run_baseline(vla, save_dir="/content/eval_baseline")
+    # With depth action correction
+    results = run_baseline(vla, depth_model=depth_model,
+        depth_correction=True, save_dir="/content/eval_depth_correction")
 """
 
+import cv2
 import gymnasium as gym
 try:
     import mani_skill.envs
@@ -19,8 +24,7 @@ from PIL import Image
 import torch
 import imageio
 import os
-from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, Optional, Tuple
 from transforms3d.euler import euler2axangle
 
 from evaluation.simpler_env.adaptive_ensemble import AdaptiveEnsembler
@@ -68,8 +72,110 @@ def convert_action_to_maniskill2(raw_action: np.ndarray, action_scale: float = 1
     return np.concatenate([delta_pos, delta_rot_axangle, [gripper_normalized]]).astype(np.float32)
 
 
+def detect_cube_from_depth(depth_map: np.ndarray) -> Optional[Tuple[float, float]]:
+    """
+    Detect cube pixel position from depth map using 2-phase CCA.
+
+    Returns (cx, cy) centroid in pixel coordinates, or None if not found.
+    Same approach as controlmllm_vla_pipeline.create_spatial_mask but
+    returns centroid instead of grid mask.
+    """
+    depth = depth_map.astype(np.float32)
+
+    # Smooth background estimate
+    smooth = cv2.GaussianBlur(depth, (31, 31), 0)
+    abs_deviation = np.abs(smooth - depth)
+
+    # Phase 1: Find and remove robot arm (largest anomaly)
+    phase1_thr = abs_deviation.mean() + abs_deviation.std() * 1.0
+    phase1_mask = (abs_deviation > phase1_thr).astype(np.uint8)
+
+    num_labels_p1, labels_p1, stats_p1, _ = cv2.connectedComponentsWithStats(
+        phase1_mask, connectivity=8
+    )
+    arm_mask = np.zeros_like(phase1_mask)
+    if num_labels_p1 > 1:
+        areas_p1 = stats_p1[1:, cv2.CC_STAT_AREA]
+        arm_label = int(np.argmax(areas_p1)) + 1
+        arm_mask = (labels_p1 == arm_label).astype(np.uint8)
+        arm_mask = cv2.dilate(arm_mask, np.ones((15, 15), np.uint8))
+
+    # Phase 2: Detect small objects on table
+    table_deviation = abs_deviation.copy()
+    table_deviation[arm_mask > 0] = 0
+
+    table_valid = abs_deviation[arm_mask == 0]
+    if table_valid.size > 0 and table_valid.std() > 1e-6:
+        phase2_thr = table_valid.mean() + table_valid.std() * 2.0
+        phase2_thr = max(phase2_thr, table_valid.std() * 1.0)
+    else:
+        return None
+
+    target_candidates = (
+        (table_deviation > phase2_thr) & (arm_mask == 0)
+    ).astype(np.uint8)
+
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        target_candidates, connectivity=8
+    )
+
+    # Find small components (cube-sized: 2-80 pixels)
+    best_component = None
+    best_area = 0
+    for label_id in range(1, num_labels):
+        area = stats[label_id, cv2.CC_STAT_AREA]
+        if 2 <= area <= 80 and area > best_area:
+            best_area = area
+            best_component = label_id
+
+    if best_component is not None:
+        cx = centroids[best_component][0]
+        cy = centroids[best_component][1]
+        return (cx, cy)
+
+    return None
+
+
+def compute_depth_correction(
+    cube_pos: Tuple[float, float],
+    image_size: int,
+    correction_scale: float = 0.005,
+) -> np.ndarray:
+    """
+    Compute action correction vector to move gripper toward detected cube.
+
+    Maps pixel offset (cube vs image center) to action delta.
+    ManiSkill2 base_camera looks from behind/above the robot:
+      - image horizontal (left-right) → action[1] (world y, left-right)
+      - image vertical (top-bottom)   → action[0] (world x, forward-back)
+
+    Args:
+        cube_pos: (cx, cy) pixel coordinates of cube
+        image_size: image width/height (128)
+        correction_scale: magnitude of correction per unit offset
+
+    Returns:
+        correction: [dx, dy, dz, 0, 0, 0, 0] action correction
+    """
+    cx, cy = cube_pos
+    center = image_size / 2.0
+
+    # Normalized offset: [-1, 1]
+    offset_x = (cx - center) / center  # positive = cube is to the right
+    offset_y = (cy - center) / center  # positive = cube is below center
+
+    # Map image offsets to robot action space
+    # These signs may need tuning based on camera orientation
+    correction = np.zeros(7, dtype=np.float32)
+    correction[0] = correction_scale * offset_y   # image down → move forward
+    correction[1] = correction_scale * offset_x   # image right → move right
+
+    return correction
+
+
 def run_baseline(
     vla,
+    depth_model=None,
     num_trials: int = 4,
     max_steps: int = 100,
     task_instruction: str = TASK_INSTRUCTION,
@@ -78,13 +184,21 @@ def run_baseline(
     cfg_scale: float = 1.5,
     save_videos: bool = True,
     sensor_resolution: int = 128,
+    # Action ensemble
     action_ensemble: bool = True,
     action_ensemble_horizon: int = 7,
     adaptive_ensemble_alpha: float = 0.1,
+    # Depth action correction
+    depth_correction: bool = False,
+    correction_scale: float = 0.005,
 ) -> Dict[str, Any]:
     """
-    Pure MemoryVLA baseline. No depth, no ControlMLLM, no pipeline.
-    Action conversion + AdaptiveEnsembler (from original MemoryVLA repo).
+    MemoryVLA baseline with optional depth-guided action correction.
+
+    Args:
+        depth_model: DA V2 model (required if depth_correction=True)
+        depth_correction: Enable depth-guided action correction
+        correction_scale: Strength of correction (tune this!)
     """
     os.makedirs(save_dir, exist_ok=True)
 
@@ -101,7 +215,7 @@ def run_baseline(
         ),
     )
 
-    # Action ensemble (from original MemoryVLA repo: simpler_env/adaptive_ensemble.py)
+    # Action ensemble
     ensembler = None
     if action_ensemble:
         ensembler = AdaptiveEnsembler(
@@ -110,16 +224,23 @@ def run_baseline(
         )
 
     ensemble_str = f"ON (horizon={action_ensemble_horizon}, alpha={adaptive_ensemble_alpha})" if action_ensemble else "OFF"
+    depth_str = f"ON (scale={correction_scale})" if depth_correction else "OFF"
+    mode_name = "DEPTH CORRECTION" if depth_correction else "PURE BASELINE"
 
     print(f"\n{'='*60}")
-    print(f"PURE BASELINE: MemoryVLA + action conversion + ensemble")
+    print(f"{mode_name}: MemoryVLA + action conversion")
     print(f"{'='*60}")
     print(f"Task: {task_instruction}")
     print(f"Trials: {num_trials}, Max steps: {max_steps}")
     print(f"unnorm_key: {unnorm_key}")
     print(f"Action conversion: euler→axis-angle + gripper [-1,+1]")
     print(f"Action ensemble: {ensemble_str}")
+    print(f"Depth correction: {depth_str}")
     print(f"{'='*60}\n")
+
+    # Track cube detection for logging
+    cube_detected_count = 0
+    cube_total_steps = 0
 
     results = []
 
@@ -128,9 +249,11 @@ def run_baseline(
         frames = []
         total_reward = 0.0
 
-        # Reset ensemble for each trial
         if ensembler is not None:
             ensembler.reset()
+
+        # Cache cube position per trial (cube is stationary)
+        cached_cube_pos = None
 
         for step in range(max_steps):
             rgb = get_rgb_from_obs(obs)
@@ -151,11 +274,43 @@ def run_baseline(
 
             raw_action = actions[0]
 
-            # Apply action ensemble before format conversion
             if ensembler is not None:
                 raw_action = ensembler.ensemble_action(raw_action)
 
             action = convert_action_to_maniskill2(raw_action)
+
+            # Depth-guided action correction
+            if depth_correction and depth_model is not None:
+                cube_total_steps += 1
+
+                # Detect cube (use cache if available)
+                if cached_cube_pos is None:
+                    rgb_np = np.array(pil_image)
+                    if hasattr(depth_model, 'infer_image'):
+                        depth_map = depth_model.infer_image(rgb_np)
+                    else:
+                        result = depth_model(pil_image)
+                        depth_map = np.array(result["depth"]).astype(np.float32)
+
+                    cube_pos = detect_cube_from_depth(depth_map)
+                    if cube_pos is not None:
+                        cached_cube_pos = cube_pos
+                        cube_detected_count += 1
+                        if step == 0:
+                            print(f"  Trial {trial+1}: Cube detected at pixel ({cube_pos[0]:.1f}, {cube_pos[1]:.1f})")
+
+                # Apply correction if cube was found
+                if cached_cube_pos is not None:
+                    correction = compute_depth_correction(
+                        cached_cube_pos, sensor_resolution, correction_scale
+                    )
+                    action[:3] += correction[:3]
+
+                    if step == 0:
+                        print(f"  Trial {trial+1}: Correction dx={correction[0]:.4f}, dy={correction[1]:.4f}")
+                elif step == 0:
+                    print(f"  Trial {trial+1}: Cube NOT detected, no correction")
+
             obs, reward, terminated, truncated, info = env.step(
                 torch.tensor(action).unsqueeze(0)
             )
@@ -204,16 +359,22 @@ def run_baseline(
     total_success = sum(r["success"] for r in results)
     avg_reward = np.mean([r["total_reward"] for r in results])
 
+    if depth_correction and cube_total_steps > 0:
+        det_rate = 100 * cube_detected_count / num_trials
+        print(f"\nCube detection: {cube_detected_count}/{num_trials} trials ({det_rate:.0f}%)")
+
     print(f"\n{'='*60}")
-    print(f"PURE BASELINE Summary (ensemble={action_ensemble})")
+    print(f"{mode_name} Summary")
     print(f"{'='*60}")
     print(f"Success Rate: {total_success}/{num_trials} ({100*total_success/num_trials:.1f}%)")
     print(f"Avg Reward:   {avg_reward:.3f}")
     print(f"{'='*60}")
 
     return {
-        "pipeline": "PURE_BASELINE",
+        "pipeline": mode_name,
         "action_ensemble": action_ensemble,
+        "depth_correction": depth_correction,
+        "correction_scale": correction_scale,
         "success_rate": 100 * total_success / num_trials,
         "avg_reward": avg_reward,
         "results": results,

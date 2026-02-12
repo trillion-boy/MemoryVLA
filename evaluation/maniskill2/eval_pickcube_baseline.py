@@ -321,15 +321,37 @@ def run_baseline(
                         cube_detected_count += 1
                         print(f"  Trial {trial+1} step {step}: Cube detected at pixel ({cube_pos[0]:.1f}, {cube_pos[1]:.1f})")
 
-                    # Save depth map for debugging on first step
+                    # Save annotated debug image on first step
                     if is_first_attempt:
                         depth_debug_path = os.path.join(save_dir, f"trial_{trial:02d}_depth.npy")
                         np.save(depth_debug_path, depth_map)
-                        # Also save depth as visual image
+
+                        # Create side-by-side: RGB | Depth with detection overlay
                         d_norm = (depth_map - depth_map.min()) / (depth_map.max() - depth_map.min() + 1e-8)
-                        depth_vis = (d_norm * 255).astype(np.uint8)
-                        depth_vis_path = os.path.join(save_dir, f"trial_{trial:02d}_depth.png")
-                        Image.fromarray(depth_vis).save(depth_vis_path)
+                        depth_rgb = np.stack([d_norm * 255] * 3, axis=-1).astype(np.uint8)
+
+                        # Draw detected point on both
+                        rgb_annotated = rgb_np.copy()
+                        if cached_cube_pos is not None:
+                            cx_i, cy_i = int(cached_cube_pos[0]), int(cached_cube_pos[1])
+                            # Red cross on RGB
+                            cv2.drawMarker(rgb_annotated, (cx_i, cy_i), (255, 0, 0),
+                                           cv2.MARKER_CROSS, 15, 2)
+                            # Red cross on depth
+                            cv2.drawMarker(depth_rgb, (cx_i, cy_i), (255, 0, 0),
+                                           cv2.MARKER_CROSS, 15, 2)
+                            # Blue cross at center
+                            c = sensor_resolution // 2
+                            cv2.drawMarker(rgb_annotated, (c, c), (0, 0, 255),
+                                           cv2.MARKER_CROSS, 10, 1)
+                            cv2.drawMarker(depth_rgb, (c, c), (0, 0, 255),
+                                           cv2.MARKER_CROSS, 10, 1)
+
+                        # Concatenate side by side
+                        combined = np.concatenate([rgb_annotated, depth_rgb], axis=1)
+                        debug_path = os.path.join(save_dir, f"trial_{trial:02d}_debug.png")
+                        Image.fromarray(combined).save(debug_path)
+                        print(f"  Trial {trial+1}: Debug image saved → {debug_path}")
 
                 # Apply correction if cube was found
                 if cached_cube_pos is not None:

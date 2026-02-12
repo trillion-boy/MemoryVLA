@@ -111,17 +111,20 @@ class ControlMLLMVLAPipeline:
         rgb_image: Optional[np.ndarray] = None,
     ) -> torch.Tensor:
         """
-        Create attention mask via pixel-level depth anomaly detection (DA V2).
+        Create attention mask from DA V2 depth using direct depth value comparison.
 
-        Uses background masking + progressive thresholds + center-proximity scoring
-        to find the target object, then maps to 16×16 grid.
+        Key idea: the cube sits ON the table, so its depth value is slightly
+        HIGHER (closer to camera) than the surrounding table surface.
+        Instead of deviation-from-smooth (which loses the cube signal),
+        we directly find pixels that are "above the table plane".
 
         Steps:
-            1. Mask background (sky) via depth percentile
-            2. GaussianBlur → smooth → |deviation| → depth anomaly
-            3. Phase 1: Find & remove robot arm (largest anomaly component)
-            4. Phase 2: Progressive thresholds + center-proximity scoring
-            5. Map detected pixels to 16×16 grid + 3×3 neighborhood
+            1. Mask background (sky): depth < 20th percentile
+            2. Find & mask robot arm: deviation-based (arm has huge deviation)
+            3. Remaining pixels = table region
+            4. Find pixels where depth > high percentile of table = "above table"
+            5. CCA + center-proximity → cube
+            6. Map to 16×16 grid
 
         Returns:
             (mask_tensor, detection_success): Tensor [1, 256], bool
@@ -135,21 +138,18 @@ class ControlMLLMVLAPipeline:
         block_h = h // grid_h
         block_w = w // grid_w
 
-        # --- Mask background (sky) ---
-        # DA V2 relative depth: far = low values (sky), close = high values
+        # === Step 1: Mask background (sky) ===
+        # DA V2: far = low values (sky), close = high values (table, arm, cube)
         depth_p20 = np.percentile(depth, 20)
         bg_mask = (depth < depth_p20).astype(np.uint8)
         bg_mask = cv2.dilate(bg_mask, np.ones((11, 11), np.uint8))
 
-        # --- Smooth background estimate ---
-        ksize = 31
-        smooth = cv2.GaussianBlur(depth, (ksize, ksize), 0)
+        # === Step 2: Find and mask robot arm ===
+        # Arm has huge deviation from smooth → use deviation only for arm detection
+        smooth = cv2.GaussianBlur(depth, (31, 31), 0)
         abs_deviation = np.abs(smooth - depth)
-
-        # Zero out background in deviation
         abs_deviation[bg_mask > 0] = 0
 
-        # ---- Phase 1: Find and REMOVE robot arm (largest anomaly) ----
         phase1_thr = abs_deviation.mean() + abs_deviation.std() * 1.0
         phase1_mask = (abs_deviation > phase1_thr).astype(np.uint8)
 
@@ -166,71 +166,56 @@ class ControlMLLMVLAPipeline:
         # Combined exclusion: background + arm
         exclude_mask = np.maximum(bg_mask, arm_mask)
 
-        # ---- Phase 2: Detect small objects with progressive thresholds ----
-        table_deviation = abs_deviation.copy()
-        table_deviation[exclude_mask > 0] = 0
+        # === Step 3: Direct depth value — find "above table" pixels ===
+        # Table region = everything not bg and not arm
+        table_pixels = depth[exclude_mask == 0]
 
-        table_valid = abs_deviation[exclude_mask == 0]
-        if table_valid.size == 0 or table_valid.std() < 1e-6:
-            phase2_thr = abs_deviation.std() * 0.5
-        else:
-            phase2_thr = None  # will use progressive
-
+        target_mask = np.zeros((h, w), dtype=np.uint8)
+        kept_components = []
+        used_pct = 0
         center_x, center_y = w / 2.0, h / 2.0
         max_dist = np.sqrt(center_x**2 + center_y**2)
 
-        # Target mask for grid mapping
-        target_mask = np.zeros((h, w), dtype=np.uint8)
-        kept_components = []
-        threshold = 0
+        if table_pixels.size > 0:
+            # Progressive percentile: start strict (99th), relax if needed
+            # Cube is CLOSER to camera than table → higher depth value
+            # → cube pixels are in the TOP percentile of the table region
+            for pct in [99.5, 99, 97, 95]:
+                threshold = np.percentile(table_pixels, pct)
+                above_table = (
+                    (depth > threshold) & (exclude_mask == 0)
+                ).astype(np.uint8)
 
-        multipliers = [2.0, 1.5, 1.0, 0.5]
-        for multiplier in multipliers:
-            if phase2_thr is not None:
-                thr = phase2_thr
-            else:
-                thr = table_valid.mean() + table_valid.std() * multiplier
+                # CCA to find connected components
+                num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                    above_table, connectivity=8
+                )
 
-            target_candidates = (
-                (table_deviation > thr) & (exclude_mask == 0)
-            ).astype(np.uint8)
-
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-                target_candidates, connectivity=8
-            )
-
-            # Score: prefer center-close, reasonably sized components
-            best_component = None
-            best_score = -1
-            for label_id in range(1, num_labels):
-                area = stats[label_id, cv2.CC_STAT_AREA]
-                if area < 1 or area > 500:
-                    continue
-                cx, cy = centroids[label_id]
-                dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
-                proximity = 1.0 - (dist / max_dist)
-                if proximity > best_score:
-                    best_score = proximity
-                    best_component = label_id
-
-            if best_component is not None:
-                # Use this component (and any other qualifying ones at this threshold)
+                # Score: prefer small, center-close components (cube, not edge artifacts)
+                best_component = None
+                best_score = -1
                 for label_id in range(1, num_labels):
                     area = stats[label_id, cv2.CC_STAT_AREA]
-                    if 1 <= area <= 500:
-                        target_mask[labels == label_id] = 1
-                        cx = centroids[label_id][0]
-                        cy = centroids[label_id][1]
-                        kept_components.append((label_id, area, cx, cy))
-                threshold = thr
-                break
+                    if area < 3 or area > 500:
+                        continue
+                    cx, cy = centroids[label_id]
+                    dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
+                    proximity = 1.0 - (dist / max_dist)
+                    if proximity > best_score:
+                        best_score = proximity
+                        best_component = label_id
 
-            # If fixed threshold, don't loop
-            if phase2_thr is not None:
-                threshold = thr
-                break
+                if best_component is not None:
+                    # Found the cube — use ONLY the best component
+                    target_mask[labels == best_component] = 1
+                    area = stats[best_component, cv2.CC_STAT_AREA]
+                    cx = centroids[best_component][0]
+                    cy = centroids[best_component][1]
+                    kept_components.append((best_component, area, cx, cy))
+                    used_pct = pct
+                    break
 
-        # --- Map pixel detections to 16×16 grid ---
+        # === Step 4: Map pixel detections to 16×16 grid ===
         mask_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
         for i in range(grid_h):
             for j in range(grid_w):
@@ -239,7 +224,7 @@ class ControlMLLMVLAPipeline:
                 if block.sum() > 0:
                     mask_grid[i, j] = 1.0
 
-        # Add 3×3 neighborhood around each detected grid cell
+        # Add 3×3 neighborhood (cube spans ~1-2 grid cells, pad for safety)
         if mask_grid.sum() > 0:
             detected = mask_grid.copy()
             for i in range(grid_h):
@@ -251,21 +236,21 @@ class ControlMLLMVLAPipeline:
                                 if 0 <= r < grid_h and 0 <= c < grid_w:
                                     mask_grid[r, c] = 1.0
 
-        # --- Fallback ---
+        # === Fallback ===
         detection_success = mask_grid.sum() > 0
         if not detection_success:
             if self._last_good_mask is not None:
-                print("    WARNING: No depth anomaly found, reusing last known mask")
+                print("    WARNING: No object found above table, reusing last known mask")
                 mask_grid = self._last_good_mask.copy()
             else:
-                print("    WARNING: No depth anomaly found and no prior mask, using center fallback")
+                print("    WARNING: No object found and no prior mask, using center fallback")
                 for i in range(grid_h // 2 - 1, grid_h // 2 + 2):
                     for j in range(grid_w // 2 - 1, grid_w // 2 + 2):
                         mask_grid[i, j] = 1.0
         else:
             self._last_good_mask = mask_grid.copy()
 
-        # --- Debug visualization ---
+        # === Debug visualization ===
         if debug_save_path:
             fig, axes = plt.subplots(1, 6, figsize=(30, 5))
             if rgb_image is not None:
@@ -277,8 +262,11 @@ class ControlMLLMVLAPipeline:
             axes[1].imshow(depth, cmap="inferno", interpolation="nearest")
             axes[1].set_title(f"DA V2 depth ({h}×{w})")
 
-            axes[2].imshow(abs_deviation, cmap="hot", interpolation="nearest")
-            axes[2].set_title(f"|Deviation| from smooth\nbg+arm removed")
+            # Show depth with exclusion applied (table region only)
+            table_vis = depth.copy()
+            table_vis[exclude_mask > 0] = np.nan
+            axes[2].imshow(table_vis, cmap="inferno", interpolation="nearest")
+            axes[2].set_title(f"Table region only\n(bg+arm excluded)")
 
             axes[3].imshow(exclude_mask, cmap="gray", interpolation="nearest")
             bg_pct = 100 * bg_mask.sum() / (h * w)
@@ -287,9 +275,9 @@ class ControlMLLMVLAPipeline:
 
             axes[4].imshow(target_mask, cmap="gray", interpolation="nearest")
             comp_info = ", ".join(
-                f"{a}px" for _, a, _, _ in kept_components
+                f"{a}px@({cx:.0f},{cy:.0f})" for _, a, cx, cy in kept_components
             ) if kept_components else "none"
-            axes[4].set_title(f"Phase 2: Table objects\nthr={threshold:.3f} [{comp_info}]")
+            axes[4].set_title(f"Above table (P{used_pct})\n[{comp_info}]")
 
             axes[5].imshow(mask_grid, cmap="hot", interpolation="nearest")
             axes[5].set_title(f"Final mask (16×16)\n{int(mask_grid.sum())} patches")

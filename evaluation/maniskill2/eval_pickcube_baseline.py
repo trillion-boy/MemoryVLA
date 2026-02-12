@@ -77,36 +77,28 @@ def detect_cube_from_depth(
     debug: bool = False,
 ) -> Optional[Tuple[float, float]]:
     """
-    Detect cube pixel position from DA V2 depth map using 2-phase CCA.
+    Detect cube pixel position from DA V2 depth using direct depth value comparison.
+
+    Key idea: cube sits ON table → its depth is slightly HIGHER (closer to camera)
+    than the table surface. Find pixels in the top percentile of the table region.
 
     Returns (cx, cy) centroid in pixel coordinates, or None if not found.
-    Uses progressive thresholds with background masking and center-proximity scoring.
     """
     depth = depth_map.astype(np.float32)
     h, w = depth.shape[:2]
 
-    # === Mask background (sky) ===
-    # DA V2 relative depth: far = low values (sky), close = high values (table, arm)
+    # Step 1: Mask background (sky)
     depth_p20 = np.percentile(depth, 20)
     bg_mask = (depth < depth_p20).astype(np.uint8)
     bg_mask = cv2.dilate(bg_mask, np.ones((11, 11), np.uint8))
 
-    # Smooth background estimate
+    # Step 2: Find and mask robot arm (deviation-based, arm has huge deviation)
     smooth = cv2.GaussianBlur(depth, (31, 31), 0)
     abs_deviation = np.abs(smooth - depth)
-
-    # Zero out background region in deviation
     abs_deviation[bg_mask > 0] = 0
 
-    if debug:
-        bg_pct = 100 * bg_mask.sum() / (h * w)
-        print(f"    [depth] shape={depth.shape}, dev mean={abs_deviation.mean():.4f}, "
-              f"std={abs_deviation.std():.4f}, max={abs_deviation.max():.4f}, bg_masked={bg_pct:.0f}%")
-
-    # Phase 1: Find and remove robot arm (largest anomaly)
     phase1_thr = abs_deviation.mean() + abs_deviation.std() * 1.0
     phase1_mask = (abs_deviation > phase1_thr).astype(np.uint8)
-
     num_labels_p1, labels_p1, stats_p1, _ = cv2.connectedComponentsWithStats(
         phase1_mask, connectivity=8
     )
@@ -117,70 +109,66 @@ def detect_cube_from_depth(
         arm_mask = (labels_p1 == arm_label).astype(np.uint8)
         arm_mask = cv2.dilate(arm_mask, np.ones((15, 15), np.uint8))
         if debug:
-            print(f"    [phase1] arm area={areas_p1[arm_label-1]}, total components={num_labels_p1-1}")
+            print(f"    [arm] area={areas_p1[arm_label-1]}")
 
-    # Combine exclusion mask: background + arm
     exclude_mask = np.maximum(bg_mask, arm_mask)
 
-    # Phase 2: Detect small objects on table with progressive thresholds
-    table_deviation = abs_deviation.copy()
-    table_deviation[exclude_mask > 0] = 0
-
-    table_valid = abs_deviation[exclude_mask == 0]
-    if table_valid.size == 0 or table_valid.std() < 1e-6:
+    # Step 3: Direct depth value — find "above table" pixels
+    table_pixels = depth[exclude_mask == 0]
+    if table_pixels.size == 0:
         if debug:
-            print(f"    [phase2] FAIL: table_valid empty or zero std")
+            print(f"    [detect] FAIL: no table pixels")
         return None
 
     center_x, center_y = w / 2.0, h / 2.0
     max_dist = np.sqrt(center_x**2 + center_y**2)
 
-    # Try progressively lower thresholds
-    for multiplier in [2.0, 1.5, 1.0, 0.5]:
-        phase2_thr = table_valid.mean() + table_valid.std() * multiplier
+    if debug:
+        bg_pct = 100 * bg_mask.sum() / (h * w)
+        print(f"    [depth] shape={depth.shape}, table_pixels={table_pixels.size}, "
+              f"bg_masked={bg_pct:.0f}%, table_depth: median={np.median(table_pixels):.2f}, "
+              f"std={np.std(table_pixels):.2f}")
 
-        target_candidates = (
-            (table_deviation > phase2_thr) & (exclude_mask == 0)
+    for pct in [99.5, 99, 97, 95]:
+        threshold = np.percentile(table_pixels, pct)
+        above_table = (
+            (depth > threshold) & (exclude_mask == 0)
         ).astype(np.uint8)
 
         num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-            target_candidates, connectivity=8
+            above_table, connectivity=8
         )
 
-        # Score components: prefer center-close ones
         best_component = None
         best_score = -1
         all_info = []
         for label_id in range(1, num_labels):
             area = stats[label_id, cv2.CC_STAT_AREA]
-            if area < 1 or area > 500:
+            if area < 3 or area > 500:
                 continue
             cx, cy = centroids[label_id]
             dist = np.sqrt((cx - center_x)**2 + (cy - center_y)**2)
             proximity = 1.0 - (dist / max_dist)
-            score = proximity
-            all_info.append((label_id, area, cx, cy, dist, score))
-            if score > best_score:
-                best_score = score
+            all_info.append((label_id, area, cx, cy, dist, proximity))
+            if proximity > best_score:
+                best_score = proximity
                 best_component = label_id
 
         if debug:
             areas = [info[1] for info in all_info]
-            print(f"    [phase2] thr_mult={multiplier:.1f}, thr={phase2_thr:.4f}, "
-                  f"candidates={len(all_info)}, areas={sorted(areas, reverse=True)[:5]}")
-            for info in sorted(all_info, key=lambda x: -x[5])[:3]:
-                lid, a, cx, cy, d, s = info
-                print(f"      comp {lid}: area={a}, pos=({cx:.1f},{cy:.1f}), dist={d:.1f}, score={s:.2f}")
+            print(f"    [P{pct}] thr={threshold:.3f}, candidates={len(all_info)}, "
+                  f"areas={sorted(areas, reverse=True)[:5]}")
 
         if best_component is not None:
             cx = centroids[best_component][0]
             cy = centroids[best_component][1]
             if debug:
-                print(f"    [phase2] SELECTED: centroid=({cx:.1f}, {cy:.1f}), score={best_score:.2f}")
+                area = stats[best_component, cv2.CC_STAT_AREA]
+                print(f"    [detect] FOUND at P{pct}: ({cx:.1f}, {cy:.1f}), area={area}")
             return (cx, cy)
 
     if debug:
-        print(f"    [phase2] FAIL: no component found at any threshold")
+        print(f"    [detect] FAIL: no component found at any percentile")
     return None
 
 

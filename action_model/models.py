@@ -150,16 +150,25 @@ class DiTBlock(nn.Module):
 
             self.norm3 = nn.LayerNorm(hidden_size, eps=1e-6)
 
-    def forward(self, x, per_token):
+    def forward(self, x, per_token, return_attn_weights=False):
         x = x + self.attn(self.norm1(x))
 
+        attn_weights = None
         if self.use_per_attn:
             assert per_token is not None
 
-            x_c, _ = self.per_attn(self.norm3(x), per_token, per_token)
+            if return_attn_weights:
+                x_c, attn_weights = self.per_attn(
+                    self.norm3(x), per_token, per_token,
+                    need_weights=True, average_attn_weights=False,
+                )
+            else:
+                x_c, _ = self.per_attn(self.norm3(x), per_token, per_token)
             x = x + x_c
 
         x = x + self.mlp(self.norm2(x))
+        if return_attn_weights:
+            return x, attn_weights
         return x
 
 
@@ -276,13 +285,14 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(self, x, t, z, per_token=None):
+    def forward(self, x, t, z, per_token=None, return_attn_weights=False):
         """
         Forward pass of DiT.
         history: (N, H, D) tensor of action history # not used now
         x: (N, T, D) tensor of predicting action inputs
         t: (N,) tensor of diffusion timesteps
         z: (N, 1, D) tensor of conditions
+        return_attn_weights: if True, also return per_attn weights from all blocks
         """
         x = self.x_embedder(x)                              # (N, T, D)
         t = self.t_embedder(t)                              # (N, D)
@@ -294,10 +304,23 @@ class DiT(nn.Module):
         c = t.unsqueeze(1) + z                              # (N, 1, D)
         x = torch.cat((c, x), dim=1)                        # (N, T+1, D)
         x = x + self.positional_embedding                   # (N, T+1, D)
+
+        all_attn_weights = []
         for block in self.blocks:
-            x = block(x, per_token)                                    # (N, T+1, D)
+            if return_attn_weights:
+                x, attn_w = block(x, per_token, return_attn_weights=True)
+                if attn_w is not None:
+                    all_attn_weights.append(attn_w)
+            else:
+                x = block(x, per_token)                                    # (N, T+1, D)
+
         x = self.final_layer(x)                             # (N, T+1, out_channels)
-        # print('parameters', self.final_layer, self.final_layer.parameters())
+
+        if return_attn_weights:
+            # Stack: [num_blocks, B, heads, T+1, num_patches]
+            attn_stack = torch.stack(all_attn_weights, dim=0) if all_attn_weights else None
+            return x[:, 1:, :], attn_stack
+
         return x[:, 1:, :]     # (N, T, C)
 
     def forward_with_cfg(self, x, t, z, cfg_scale, per_token):

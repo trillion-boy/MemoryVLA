@@ -835,6 +835,175 @@ class MemoryVLA(nn.Module):
 
         return actions, normalized_actions
 
+    def predict_action_with_control(
+        self,
+        image: Image,
+        instruction: str,
+        target_grid: torch.Tensor,
+        unnorm_key: Optional[str] = None,
+        cfg_scale: float = 1.5,
+        use_ddim: bool = False,
+        num_ddim_steps: int = 10,
+        episode_first_frame: str = 'False',
+        control_steps: int = 5,
+        control_alpha: float = 100.0,
+        control_timestep: int = 50,
+        **kwargs: str,
+    ) -> np.ndarray:
+        """
+        Action prediction with ControlMLLM-style visual grounding on DiT.
+
+        Identical to predict_action, but optimizes a perturbation (pv) on per_tokens
+        so that DiT cross-attention focuses on the target region before sampling.
+
+        Args:
+            image: PIL Image
+            instruction: Task instruction string
+            target_grid: [N_patches] or [1, N_patches] binary tensor (from SAM mask)
+            control_steps: Number of pv optimization iterations (T)
+            control_alpha: Learning rate for pv optimization
+            control_timestep: Diffusion timestep for attention probing
+            (other args same as predict_action)
+
+        Returns:
+            actions, normalized_actions (same as predict_action)
+        """
+        from action_model.control_dit import ControlDiT
+
+        image_transform, tokenizer = self.vlm.vision_backbone.image_transform, self.vlm.llm_backbone.tokenizer
+
+        # Build VLA Prompt
+        prompt_builder = self.vlm.get_prompt_builder()
+        prompt_builder.add_turn(role="human", message=f"What action should the robot take to {instruction.lower()}?")
+        prompt_text = prompt_builder.get_prompt()
+
+        input_ids = tokenizer(prompt_text, truncation=True, return_tensors="pt").input_ids.to(self.vlm.device)
+        if isinstance(tokenizer, LlamaTokenizerFast):
+            input_ids = torch.cat(
+                (input_ids, torch.unsqueeze(torch.Tensor([29871, 2]).long(), dim=0).to(self.vlm.device)), dim=1
+            )
+        else:
+            raise ValueError(f"Unsupported `tokenizer` type = {type(tokenizer)}")
+
+        model_dtype = next(self.parameters()).dtype
+
+        # Preprocess Image
+        pixel_values = image_transform(image)
+        if isinstance(pixel_values, torch.Tensor):
+            pixel_values = pixel_values[None, ...].to(self.vlm.device, dtype=model_dtype)
+        elif isinstance(pixel_values, dict):
+            pixel_values = {k: v[None, ...].to(self.vlm.device, dtype=model_dtype) for k, v in pixel_values.items()}
+        else:
+            raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+
+        autocast_dtype = torch.bfloat16 if model_dtype == torch.bfloat16 else torch.float32
+
+        # === Phase 1: Extract cog_tokens and per_tokens (no grad needed for VLM) ===
+        with torch.inference_mode():
+            with torch.autocast("cuda", dtype=autocast_dtype, enabled=(autocast_dtype == torch.bfloat16)):
+                output = super(PrismaticVLM, self.vlm).generate(
+                    input_ids=input_ids,
+                    pixel_values=pixel_values,
+                    max_new_tokens=1,
+                    output_hidden_states=True,
+                    return_dict_in_generate=True,
+                    **kwargs,
+                )
+
+            model_dtype = next(self.action_model.net.parameters()).dtype
+            cog_tokens = output.hidden_states[-1][-1][:, -1, :]
+            assert (cog_tokens.shape[0], cog_tokens.shape[1]) == (1, 4096)
+            cog_tokens = cog_tokens.unsqueeze(1).to(model_dtype)
+
+            vision_feats = self.vlm.vision_feats
+            per_tokens = self.per_compr(vision_feats)
+
+            # Memory bank processing
+            assert episode_first_frame in ['True', 'False']
+            if episode_first_frame == 'True':
+                print(" ** reset memory ** ")
+                self.cog_mem_bank.reset()
+                self.per_mem_bank.reset()
+                self.cur_timestep = 0
+
+            episode_ids = [0]
+            timesteps = [torch.tensor(self.cur_timestep, device=cog_tokens.device)]
+            self.cur_timestep += 1
+
+            cog_tokens = self.cog_mem_bank.process_batch(
+                tokens=cog_tokens, episode_ids=episode_ids, timesteps=timesteps,
+            )
+            per_tokens = self.per_mem_bank.process_batch(
+                tokens=per_tokens, episode_ids=episode_ids, timesteps=timesteps,
+            )
+
+        # === Phase 2: ControlMLLM optimization (requires grad on pv only) ===
+        controller = ControlDiT(self.action_model.net)
+        pv, losses = controller.optimize(
+            per_tokens=per_tokens,
+            cog_tokens=cog_tokens,
+            target_grid=target_grid,
+            T=control_steps,
+            alpha=control_alpha,
+            diffusion_timestep=control_timestep,
+        )
+        per_tokens_controlled = per_tokens + pv
+
+        # === Phase 3: Diffusion sampling with controlled per_tokens ===
+        with torch.inference_mode():
+            B = cog_tokens.shape[0]
+            noise = torch.randn(
+                B, self.future_action_window_size + 1,
+                self.action_model.in_channels,
+                device=cog_tokens.device,
+            ).to(model_dtype)
+
+            using_cfg = cfg_scale > 1.0
+            if using_cfg:
+                noise = torch.cat([noise, noise], 0)
+                uncondition = self.action_model.net.z_embedder.uncondition
+                uncondition = uncondition.unsqueeze(0).expand(B, *uncondition.shape[1:])
+                z = torch.cat([cog_tokens, uncondition], 0)
+                model_kwargs = dict(z=z, cfg_scale=cfg_scale)
+                sample_fn = self.action_model.net.forward_with_cfg
+                model_kwargs.update({'per_token': per_tokens_controlled.repeat(2, 1, 1)})
+            else:
+                model_kwargs = dict(z=cog_tokens)
+                sample_fn = self.action_model.net.forward
+                model_kwargs.update({'per_token': per_tokens_controlled})
+
+            if use_ddim and num_ddim_steps is not None:
+                if self.action_model.ddim_diffusion is None:
+                    self.action_model.create_ddim(ddim_step=num_ddim_steps)
+                samples = self.action_model.ddim_diffusion.ddim_sample_loop(
+                    sample_fn, noise.shape, noise,
+                    clip_denoised=False, model_kwargs=model_kwargs,
+                    progress=False, device=cog_tokens.device, eta=0.0,
+                )
+            else:
+                samples = self.action_model.diffusion.p_sample_loop(
+                    sample_fn, noise.shape, noise,
+                    clip_denoised=False, model_kwargs=model_kwargs,
+                    progress=False, device=cog_tokens.device,
+                )
+
+            if using_cfg:
+                samples, _ = samples.chunk(2, dim=0)
+            normalized_actions = samples[0].cpu().numpy()
+
+        # Un-normalize Actions
+        action_norm_stats = self.get_action_stats(unnorm_key)
+        mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
+        action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
+        normalized_actions = np.clip(normalized_actions, -1, 1)
+        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
+        actions = np.where(
+            mask,
+            0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
+            normalized_actions,
+        )
+
+        return actions, normalized_actions, losses
 
     @staticmethod
     def _check_unnorm_key(norm_stats, unnorm_key):

@@ -398,6 +398,9 @@ class MemoryVLA(nn.Module):
         self.update_fused = update_fused
 
         self.cur_timestep = 0
+        self.per_token_prior: Optional[torch.Tensor] = None
+        self.per_token_prior_strength: float = 0.0
+        self.per_token_prior_mode: str = "add"
 
         self.vision_dim = self.vlm.vision_backbone.dino_featurizer.patch_embed.proj.weight.shape[0] + \
                  self.vlm.vision_backbone.siglip_featurizer.patch_embed.proj.weight.shape[0]
@@ -477,6 +480,95 @@ class MemoryVLA(nn.Module):
     def freeze_backbones(self, stage):
         self.vlm.freeze_backbones(stage)
 
+    @staticmethod
+    def _normalize_prior_map(prior: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+        prior_min = prior.amin(dim=-1, keepdim=True)
+        prior_max = prior.amax(dim=-1, keepdim=True)
+        return (prior - prior_min) / (prior_max - prior_min + eps)
+
+    def _prepare_per_token_prior(self, prior: torch.Tensor, per_tokens: torch.Tensor) -> torch.Tensor:
+        """Prepare a patch-level prior in shape [B, N, 1] from [N], [B, N], [H, W], [B, H, W], [B, N, 1]."""
+        if prior.dim() == 1:
+            prior = prior.unsqueeze(0)
+
+        if prior.dim() == 2:
+            if prior.shape[1] != per_tokens.shape[1]:
+                raise ValueError(
+                    f"Invalid prior length {prior.shape[1]} for per-token length {per_tokens.shape[1]}"
+                )
+            prior = prior.unsqueeze(-1)
+
+        elif prior.dim() == 3:
+            if prior.shape[-1] == 1 and prior.shape[1] == per_tokens.shape[1]:
+                pass
+            elif prior.shape[1] * prior.shape[2] == per_tokens.shape[1]:
+                prior = prior.reshape(prior.shape[0], -1, 1)
+            else:
+                raise ValueError(
+                    f"Invalid 3D prior shape {tuple(prior.shape)} for per-token length {per_tokens.shape[1]}"
+                )
+        else:
+            raise ValueError(f"Unsupported prior shape: {tuple(prior.shape)}")
+
+        if prior.shape[0] == 1 and per_tokens.shape[0] > 1:
+            prior = prior.expand(per_tokens.shape[0], -1, -1)
+        elif prior.shape[0] != per_tokens.shape[0]:
+            raise ValueError(
+                f"Prior batch size {prior.shape[0]} must match token batch size {per_tokens.shape[0]}"
+            )
+
+        return prior.to(device=per_tokens.device, dtype=per_tokens.dtype)
+
+    def set_per_token_prior(
+        self,
+        prior: torch.Tensor,
+        strength: float = 0.1,
+        mode: str = "add",
+    ) -> None:
+        """Set a reusable inference-time spatial prior for per_tokens.
+
+        Args:
+            prior: Patch prior map ([N], [B,N], [H,W], [B,H,W], [B,N,1]).
+            strength: Injection gain.
+            mode: One of {"add", "mul"}.
+        """
+        if mode not in {"add", "mul"}:
+            raise ValueError(f"Unsupported prior mode: {mode}")
+        self.per_token_prior = prior.detach().clone()
+        self.per_token_prior_strength = float(strength)
+        self.per_token_prior_mode = mode
+
+    def clear_per_token_prior(self) -> None:
+        self.per_token_prior = None
+        self.per_token_prior_strength = 0.0
+
+    def _apply_per_token_prior(
+        self,
+        per_tokens: torch.Tensor,
+        prior: Optional[torch.Tensor] = None,
+        strength: Optional[float] = None,
+        mode: Optional[str] = None,
+    ) -> torch.Tensor:
+        prior = self.per_token_prior if prior is None else prior
+        if prior is None:
+            return per_tokens
+
+        mode = self.per_token_prior_mode if mode is None else mode
+        if mode not in {"add", "mul"}:
+            raise ValueError(f"Unsupported prior mode: {mode}")
+
+        strength = self.per_token_prior_strength if strength is None else float(strength)
+        if strength == 0.0:
+            return per_tokens
+
+        prior_map = self._prepare_per_token_prior(prior, per_tokens)
+        prior_map = self._normalize_prior_map(prior_map.squeeze(-1)).unsqueeze(-1)
+
+        if mode == "add":
+            token_scale = per_tokens.detach().std(dim=-1, keepdim=True).mean().clamp(min=1e-6)
+            return per_tokens + strength * prior_map * token_scale
+        return per_tokens * (1.0 + strength * prior_map)
+
     def forward(
         self,
         input_ids: torch.LongTensor=None,
@@ -494,6 +586,10 @@ class MemoryVLA(nn.Module):
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         repeated_diffusion_steps: int = 4,
+        per_token_prior: Optional[torch.FloatTensor] = None,
+        per_token_prior_strength: Optional[float] = None,
+        per_token_prior_mode: Optional[str] = None,
+        per_token_cond_scale: float = 0.0,
     ) -> Tuple:
         """Run a forward pass through the VLM, returning a CausalLMOutputWithPast instance (contains loss)."""
 
@@ -532,6 +628,12 @@ class MemoryVLA(nn.Module):
 
         vision_feats = self.vlm.vision_feats
         per_tokens = self.per_compr(vision_feats)
+        per_tokens = self._apply_per_token_prior(
+            per_tokens,
+            prior=per_token_prior,
+            strength=per_token_prior_strength,
+            mode=per_token_prior_mode,
+        )
 
         cog_tokens = self.cog_mem_bank.process_batch(
             tokens=cog_tokens,
@@ -560,6 +662,7 @@ class MemoryVLA(nn.Module):
             actions_repeated,
             cog_tokens_repeated,
             per_tokens_repeated,
+            per_token_cond_scale=per_token_cond_scale,
         )
 
         return loss, output
@@ -679,13 +782,17 @@ class MemoryVLA(nn.Module):
 
     @torch.inference_mode()
     def predict_action(
-        self, image: Image, 
+        self, image: Image,
         instruction: str,
-        unnorm_key: Optional[str] = None, 
-        cfg_scale: float = 1.5, 
+        unnorm_key: Optional[str] = None,
+        cfg_scale: float = 1.5,
         use_ddim: bool = False,
         num_ddim_steps: int = 10,
         episode_first_frame: str = 'False',
+        per_token_prior: Optional[torch.Tensor] = None,
+        per_token_prior_strength: Optional[float] = None,
+        per_token_prior_mode: Optional[str] = None,
+        per_token_cond_scale: float = 0.0,
         **kwargs: str
     ) -> np.ndarray:
         """
@@ -749,6 +856,12 @@ class MemoryVLA(nn.Module):
 
         vision_feats = self.vlm.vision_feats
         per_tokens = self.per_compr(vision_feats)
+        per_tokens = self._apply_per_token_prior(
+            per_tokens,
+            prior=per_token_prior,
+            strength=per_token_prior_strength,
+            mode=per_token_prior_mode,
+        )
 
         assert episode_first_frame in ['True', 'False'], "episode_first_frame must be 'True' or 'False'"
         if episode_first_frame == 'True':
@@ -776,7 +889,7 @@ class MemoryVLA(nn.Module):
         # Sample random noise
         B = cog_tokens.shape[0]
         noise = torch.randn(B, self.future_action_window_size+1, self.action_model.in_channels, device=cog_tokens.device).to(model_dtype)  #[B, T, D]
-    
+
         # Setup classifier-free guidance:
         using_cfg = cfg_scale > 1.0
         if using_cfg:
@@ -786,11 +899,18 @@ class MemoryVLA(nn.Module):
             uncondition = uncondition.expand(B, *uncondition.shape[1:]) #[B, k, D]
             z = torch.cat([cog_tokens, uncondition], 0)
             cfg_scale = cfg_scale
-            model_kwargs = dict(z=z, cfg_scale=cfg_scale)
+            model_kwargs = dict(
+                z=z,
+                cfg_scale=cfg_scale,
+                per_token_cond_scale=per_token_cond_scale,
+            )
             sample_fn = self.action_model.net.forward_with_cfg
             model_kwargs.update({'per_token': per_tokens.repeat(2, 1, 1)})  # Repeat for unconditioned and conditioned samples
         else:
-            model_kwargs = dict(z=cog_tokens)
+            model_kwargs = dict(
+                z=cog_tokens,
+                per_token_cond_scale=per_token_cond_scale,
+            )
             sample_fn = self.action_model.net.forward
             model_kwargs.update({'per_token': per_tokens})
 

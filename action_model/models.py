@@ -285,7 +285,7 @@ class DiT(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    def forward(self, x, t, z, per_token=None, return_attn_weights=False):
+    def forward(self, x, t, z, per_token=None, return_attn_weights=False, per_token_cond_scale=0.0):
         """
         Forward pass of DiT.
         history: (N, H, D) tensor of action history # not used now
@@ -293,6 +293,8 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         z: (N, 1, D) tensor of conditions
         return_attn_weights: if True, also return per_attn weights from all blocks
+        per_token_cond_scale: if > 0, inject per_token summary into condition c=t+z
+                              (bypasses dead per_attn by routing spatial info through condition)
         """
         x = self.x_embedder(x)                              # (N, T, D)
         t = self.t_embedder(t)                              # (N, D)
@@ -302,6 +304,12 @@ class DiT(nn.Module):
             per_token = self.per_token_embedder(per_token)      # (N, P, D_per)
 
         c = t.unsqueeze(1) + z                              # (N, 1, D)
+
+        # Per-token condition bypass: inject spatial summary into condition
+        # This routes per_token information through c, bypassing dead per_attn
+        if per_token_cond_scale > 0.0 and per_token is not None:
+            per_summary = per_token.mean(dim=1, keepdim=True)  # (N, 1, D)
+            c = c + per_token_cond_scale * per_summary
         x = torch.cat((c, x), dim=1)                        # (N, T+1, D)
         x = x + self.positional_embedding                   # (N, T+1, D)
 
@@ -323,7 +331,7 @@ class DiT(nn.Module):
 
         return x[:, 1:, :]     # (N, T, C)
 
-    def forward_with_cfg(self, x, t, z, cfg_scale, per_token):
+    def forward_with_cfg(self, x, t, z, cfg_scale, per_token, per_token_cond_scale=0.0):
         """
         Forward pass of Diffusion, but also batches the unconditional forward pass for classifier-free guidance.
         """
@@ -332,7 +340,7 @@ class DiT(nn.Module):
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0).to(
             next(self.x_embedder.parameters()).dtype)
-        model_out = self.forward(combined, t, z, per_token)
+        model_out = self.forward(combined, t, z, per_token, per_token_cond_scale=per_token_cond_scale)
         # eps, rest = model_out[:, :self.in_channels], model_out[:, self.in_channels:]
         eps, rest = model_out[:, :,
                               :self.in_channels], model_out[:, :, self.in_channels:]

@@ -54,7 +54,7 @@ class ActionModel(nn.Module):
             )
 
     # Given condition z and ground truth token x, compute loss
-    def loss(self, x, z, per_token):
+    def loss(self, x, z, per_token, per_token_cond_scale=0.0):
         # sample random noise and timestep
         noise = torch.randn_like(x) # [B, T, C]
 
@@ -64,7 +64,7 @@ class ActionModel(nn.Module):
         x_t = self.diffusion.q_sample(x, timestep, noise)
 
         # predict noise from x_t
-        noise_pred = self.net(x_t, timestep, z, per_token=per_token)
+        noise_pred = self.net(x_t, timestep, z, per_token=per_token, per_token_cond_scale=per_token_cond_scale)
 
         assert noise_pred.shape == noise.shape == x.shape
         # Compute L2 loss

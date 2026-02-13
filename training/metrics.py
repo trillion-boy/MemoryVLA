@@ -5,11 +5,6 @@ Utility classes defining a Metrics container and multiple Trackers to enable mod
 endpoints (e.g., JSONL local logs, Weights & Biases).
 """
 
-# for volc， if you don't use volc, please remove the following 3 lines
-import sys
-from volcengine_ml_platform import wandb
-sys.modules['wandb'] = wandb
-
 import time
 from collections import defaultdict, deque
 from pathlib import Path

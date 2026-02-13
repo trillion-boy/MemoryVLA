@@ -962,7 +962,8 @@ class MemoryVLA(nn.Module):
             if using_cfg:
                 noise = torch.cat([noise, noise], 0)
                 uncondition = self.action_model.net.z_embedder.uncondition
-                uncondition = uncondition.unsqueeze(0).expand(B, *uncondition.shape[1:])
+                uncondition = uncondition.unsqueeze(0)  #[k, D]
+                uncondition = uncondition.expand(B, *uncondition.shape[1:]) #[B, k, D]
                 z = torch.cat([cog_tokens, uncondition], 0)
                 model_kwargs = dict(z=z, cfg_scale=cfg_scale)
                 sample_fn = self.action_model.net.forward_with_cfg

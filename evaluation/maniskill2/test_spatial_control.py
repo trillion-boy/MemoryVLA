@@ -158,7 +158,7 @@ def run_spatial_control_test(
         (other args same as run_control_test)
     """
     if scales is None:
-        scales = [0.1, 0.3, 0.5, 1.0]
+        scales = [0.1, 0.5, 2.0, 5.0, 10.0, 50.0]
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -202,25 +202,33 @@ def run_spatial_control_test(
             print("  Skipping (no detection)")
             continue
 
-        # ====== Step 4: Baseline action (no control) ======
-        print("\n--- Baseline action prediction ---")
+        # ====== Step 4: Baseline action (scale=0, same noise seed) ======
+        # Using spatial_control with scale=0.0 as baseline ensures identical noise
+        NOISE_SEED = 42
+        print(f"\n--- Baseline action prediction (noise_seed={NOISE_SEED}) ---")
         t0 = time.time()
-        actions_base, norm_actions_base = vla.predict_action(
-            pil_224, task_instruction,
+
+        # Create zero target grid for baseline (scale=0 means no control effect)
+        zero_grid = torch.zeros_like(target_grid)
+
+        actions_base, norm_actions_base = vla.predict_action_with_spatial_control(
+            pil_224, task_instruction, zero_grid,
             unnorm_key=unnorm_key, cfg_scale=cfg_scale,
             use_ddim=use_ddim, num_ddim_steps=num_ddim_steps,
             episode_first_frame='True',
+            spatial_scale=0.0,
+            noise_seed=NOISE_SEED,
         )
         t_base = time.time() - t0
         print(f"  Baseline action[0]: {actions_base[0].round(4)}")
         print(f"  Time: {t_base:.2f}s")
 
-        # ====== Step 5: Spatial control at multiple scales ======
+        # ====== Step 5: Spatial control at multiple scales (same noise seed) ======
         actions_by_scale = {}
         diagnostics = None
 
         for scale in scales:
-            print(f"\n--- Spatial control (scale={scale}) ---")
+            print(f"\n--- Spatial control (scale={scale}, noise_seed={NOISE_SEED}) ---")
             t0 = time.time()
             actions_ctrl, norm_actions_ctrl = vla.predict_action_with_spatial_control(
                 pil_224, task_instruction, target_grid,
@@ -228,6 +236,7 @@ def run_spatial_control_test(
                 use_ddim=use_ddim, num_ddim_steps=num_ddim_steps,
                 episode_first_frame='True',
                 spatial_scale=scale,
+                noise_seed=NOISE_SEED,
             )
             t_ctrl = time.time() - t0
             actions_by_scale[scale] = actions_ctrl
@@ -235,7 +244,7 @@ def run_spatial_control_test(
             print(f"  Time: {t_ctrl:.2f}s")
 
             diff = np.abs(actions_ctrl - actions_base)
-            print(f"  Action diff (L1): {diff.mean():.4f} (max: {diff.max():.4f})")
+            print(f"  Action diff (L1): {diff.mean():.6f} (max: {diff.max():.6f})")
 
         # ====== Step 6: Run diagnostics (once, at scale=0.5) ======
         print("\n--- Running diagnostics ---")

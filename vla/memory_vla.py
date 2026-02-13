@@ -1017,6 +1017,7 @@ class MemoryVLA(nn.Module):
         num_ddim_steps: int = 10,
         episode_first_frame: str = 'False',
         spatial_scale: float = 0.5,
+        noise_seed: Optional[int] = None,
         **kwargs: str,
     ) -> np.ndarray:
         """
@@ -1114,11 +1115,20 @@ class MemoryVLA(nn.Module):
         # === Phase 3: Diffusion sampling with spatial attention override ===
         with torch.inference_mode():
             B = cog_tokens.shape[0]
-            noise = torch.randn(
-                B, self.future_action_window_size + 1,
-                self.action_model.in_channels,
-                device=cog_tokens.device,
-            ).to(model_dtype)
+            if noise_seed is not None:
+                generator = torch.Generator(device=cog_tokens.device).manual_seed(noise_seed)
+                noise = torch.randn(
+                    B, self.future_action_window_size + 1,
+                    self.action_model.in_channels,
+                    device=cog_tokens.device,
+                    generator=generator,
+                ).to(model_dtype)
+            else:
+                noise = torch.randn(
+                    B, self.future_action_window_size + 1,
+                    self.action_model.in_channels,
+                    device=cog_tokens.device,
+                ).to(model_dtype)
 
             using_cfg = cfg_scale > 1.0
             if using_cfg:

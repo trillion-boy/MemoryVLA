@@ -49,7 +49,7 @@ def render_maniskill2_images(
         import mani_skill2.envs
 
     if env_names is None:
-        env_names = ["PickCube-v0"]
+        env_names = ["PickCube-v1"]
 
     results = {}
     for env_name in env_names:
@@ -538,7 +538,7 @@ def run_full_test(
         results = run_full_test(save_dir="/content/grounding_dino_test")
     """
     if env_names is None:
-        env_names = ["PickCube-v0"]
+        env_names = ["PickCube-v1"]
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -668,7 +668,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--save-dir", default="/content/grounding_dino_test")
     parser.add_argument("--num-seeds", type=int, default=5)
-    parser.add_argument("--env-names", nargs="+", default=["PickCube-v0"])
+    parser.add_argument("--env-names", nargs="+", default=["PickCube-v1"])
     parser.add_argument("--box-threshold", type=float, default=0.15)
     parser.add_argument("--gdino-model", default="IDEA-Research/grounding-dino-tiny")
     parser.add_argument("--sam-model", default="facebook/sam-vit-base")

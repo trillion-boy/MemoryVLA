@@ -31,7 +31,7 @@ from evaluation.maniskill2.test_grounding_dino_detection import run_full_test
 results = run_full_test(
     save_dir="/content/grounding_dino_test",
     num_seeds=5,
-    env_names=["PickCube-v0"],
+    env_names=["PickCube-v1"],
     box_threshold=0.15,
 )
 ```
@@ -71,7 +71,7 @@ try:
 except:
     import mani_skill2.envs
 
-env = gym.make("PickCube-v0", obs_mode="rgbd", control_mode="pd_ee_delta_pose")
+env = gym.make("PickCube-v1", obs_mode="rgbd", control_mode="pd_ee_delta_pose")
 obs, _ = env.reset(seed=42)
 
 # RGB 추출

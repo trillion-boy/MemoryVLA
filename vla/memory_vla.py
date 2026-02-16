@@ -793,6 +793,8 @@ class MemoryVLA(nn.Module):
         per_token_prior_strength: Optional[float] = None,
         per_token_prior_mode: Optional[str] = None,
         per_token_cond_scale: float = 0.0,
+        return_confidence: bool = False,
+        confidence_type: str = 'max_prob',
         **kwargs: str
     ) -> np.ndarray:
         """
@@ -842,7 +844,8 @@ class MemoryVLA(nn.Module):
                 input_ids=input_ids,                            # Shape: [1, seq]
                 pixel_values=pixel_values,                      # Shape: [1, 3, res, res] or Dict[str, ...]
                 max_new_tokens=1,
-                output_hidden_states=True, 
+                output_hidden_states=True,
+                output_scores=True,
                 return_dict_in_generate=True,
                 **kwargs,
             )
@@ -946,14 +949,31 @@ class MemoryVLA(nn.Module):
         mask = action_norm_stats.get("mask", np.ones_like(action_norm_stats["q01"], dtype=bool))
         action_high, action_low = np.array(action_norm_stats["q99"]), np.array(action_norm_stats["q01"])
         normalized_actions = np.clip(normalized_actions, -1, 1)
-        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1) 
+        normalized_actions[:, 6] = np.where(normalized_actions[:, 6] < 0.5, 0, 1)
         actions = np.where(
             mask,
             0.5 * (normalized_actions + 1) * (action_high - action_low) + action_low,
             normalized_actions,
         )
 
-        return actions, normalized_actions
+        if not return_confidence:
+            return actions, normalized_actions
+
+        # Compute confidence from LLM token logits
+        if not hasattr(output, 'scores') or len(output.scores) == 0:
+            confidence = np.array([0.0], dtype=np.float32)
+        else:
+            token_logits = output.scores[-1]  # [B, vocab]
+            token_probs = torch.softmax(token_logits.float(), dim=-1)
+            if confidence_type == 'max_logit':
+                confidence = token_logits.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+            elif confidence_type == 'token_prob':
+                gen_ids = output.sequences[:, -1]
+                confidence = token_probs.gather(1, gen_ids.unsqueeze(-1)).squeeze(-1).detach().cpu().numpy().astype(np.float32)
+            else:  # 'max_prob'
+                confidence = token_probs.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+
+        return actions, normalized_actions, confidence
 
     def predict_action_with_control(
         self,

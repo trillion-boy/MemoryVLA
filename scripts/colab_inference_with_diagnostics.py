@@ -267,108 +267,135 @@ def diagnose_output_sensitivity(
     instruction: str,
     unnorm_key: str = "libero_spatial_no_noops",
     cfg_scale: float = 1.5,
-    n_repeats: int = 2,
+    seeds: tuple = (42, 1337, 2024),
 ) -> dict:
     """
-    Level 3: End-to-end test. Change per_token, observe action change.
+    Level 3: Paired-seed output sensitivity test.
 
-    Runs predict_action in three conditions:
+    For each seed, runs three conditions with IDENTICAL diffusion noise:
       A. Baseline (no prior, cond_scale=0.0)
       B. Random prior injected (strength=0.3, cond_scale=0.0)
       C. Random prior + bypass ON (strength=0.3, cond_scale=0.2)
 
-    If A≈B → per_attn path is dead (prior has no effect)
-    If B≈C → bypass adds nothing (per_attn already works)
-    If A≈B but A≠C → per_attn dead, but bypass works → use bypass
+    Also measures null baseline: A(seed_i) vs A(seed_j) to quantify
+    intrinsic noise variance, then compares signal vs noise floor.
 
-    Uses DDIM (10 steps) instead of DDPM (1000 steps) for ~100x speedup.
+    Uses DDIM 10 steps (eta=0) so noise is fully deterministic given seed.
     """
     device = next(vla_model.parameters()).device
     per_dim = vla_model.per_token_size
 
-    # Generate a fixed random prior
-    random_prior = torch.randn(1, per_dim, device=device) * 0.5
+    # Generate a fixed random prior (seeded for reproducibility)
+    gen = torch.Generator(device=device).manual_seed(9999)
+    random_prior = torch.randn(1, per_dim, device=device, generator=gen) * 0.5
 
-    total_calls = n_repeats * 3
+    n_seeds = len(seeds)
+    total_calls = n_seeds * 3
     call_count = [0]
 
-    def _run(prior, strength, cond_scale, label):
-        all_actions = []
-        all_confs = []
-        for _ in range(n_repeats):
-            call_count[0] += 1
-            print(f"    [{call_count[0]}/{total_calls}] {label} ...", flush=True)
-            acts, _, conf = vla_model.predict_action(
-                image=image,
-                instruction=instruction,
-                unnorm_key=unnorm_key,
-                cfg_scale=cfg_scale,
-                use_ddim=True,
-                num_ddim_steps=10,
-                episode_first_frame="True",
-                per_token_prior=prior,
-                per_token_prior_strength=strength,
-                per_token_prior_mode="add",
-                per_token_cond_scale=cond_scale,
-                return_confidence=True,
-                confidence_type="max_prob",
+    def _run_one(seed, prior, strength, cond_scale, label):
+        """Run a single predict_action with a fixed seed."""
+        call_count[0] += 1
+        print(f"    [{call_count[0]}/{total_calls}] seed={seed} {label} ...", flush=True)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        acts, _, conf = vla_model.predict_action(
+            image=image,
+            instruction=instruction,
+            unnorm_key=unnorm_key,
+            cfg_scale=cfg_scale,
+            use_ddim=True,
+            num_ddim_steps=10,
+            episode_first_frame="True",
+            per_token_prior=prior,
+            per_token_prior_strength=strength,
+            per_token_prior_mode="add",
+            per_token_cond_scale=cond_scale,
+            return_confidence=True,
+            confidence_type="max_prob",
+        )
+        return acts
+
+    # Run paired experiments: same seed → A, B, C
+    paired_deltas_ab = []
+    paired_deltas_ac = []
+    paired_deltas_bc = []
+    all_a_actions = []
+    per_seed_results = []
+
+    for seed in seeds:
+        act_a = _run_one(seed, None, 0.0, 0.0, "A: Baseline")
+        act_b = _run_one(seed, random_prior, 0.3, 0.0, "B: Prior ON, bypass OFF")
+        act_c = _run_one(seed, random_prior, 0.3, 0.2, "C: Prior ON, bypass ON")
+
+        d_ab = np.abs(act_a - act_b).mean()
+        d_ac = np.abs(act_a - act_c).mean()
+        d_bc = np.abs(act_b - act_c).mean()
+
+        paired_deltas_ab.append(d_ab)
+        paired_deltas_ac.append(d_ac)
+        paired_deltas_bc.append(d_bc)
+        all_a_actions.append(act_a)
+        per_seed_results.append({
+            "seed": seed, "act_a": act_a, "act_b": act_b, "act_c": act_c,
+            "delta_ab": d_ab, "delta_ac": d_ac, "delta_bc": d_bc,
+        })
+
+    # Null baseline: A(seed_i) vs A(seed_j) → intrinsic noise variance
+    null_deltas = []
+    for i in range(n_seeds):
+        for j in range(i + 1, n_seeds):
+            null_deltas.append(
+                np.abs(all_a_actions[i] - all_a_actions[j]).mean()
             )
-            all_actions.append(acts)
-            all_confs.append(float(conf.mean()))
-        mean_act = np.stack(all_actions).mean(axis=0)
-        mean_conf = np.mean(all_confs)
-        return {"label": label, "mean_action": mean_act, "mean_conf": mean_conf}
 
-    # Condition A: baseline
-    cond_a = _run(None, 0.0, 0.0, "A: Baseline (no prior)")
-    # Condition B: prior injected, bypass OFF
-    cond_b = _run(random_prior, 0.3, 0.0, "B: Prior ON, bypass OFF")
-    # Condition C: prior injected, bypass ON
-    cond_c = _run(random_prior, 0.3, 0.2, "C: Prior ON, bypass ON")
+    mean_delta_ab = np.mean(paired_deltas_ab)
+    mean_delta_ac = np.mean(paired_deltas_ac)
+    mean_delta_bc = np.mean(paired_deltas_bc)
+    mean_null = np.mean(null_deltas) if null_deltas else 0.0
 
-    # Compute deltas
-    delta_ab = np.abs(cond_a["mean_action"] - cond_b["mean_action"]).mean()
-    delta_ac = np.abs(cond_a["mean_action"] - cond_c["mean_action"]).mean()
-    delta_bc = np.abs(cond_b["mean_action"] - cond_c["mean_action"]).mean()
+    # Signal-to-noise: paired delta vs null baseline
+    snr_ab = mean_delta_ab / (mean_null + 1e-10)
+    snr_ac = mean_delta_ac / (mean_null + 1e-10)
 
-    conf_delta_ab = abs(cond_a["mean_conf"] - cond_b["mean_conf"])
-    conf_delta_ac = abs(cond_a["mean_conf"] - cond_c["mean_conf"])
-
-    # Interpretation
-    per_attn_effective = delta_ab > 0.005
-    bypass_effective = delta_ac > 0.005
-    bypass_adds_over_per_attn = delta_bc > 0.005
+    # Interpretation: signal must exceed noise floor by 2x to be meaningful
+    per_attn_effective = mean_delta_ab > mean_null * 2 and mean_delta_ab > 0.001
+    bypass_effective = mean_delta_ac > mean_null * 2 and mean_delta_ac > 0.001
+    bypass_adds_over_per_attn = mean_delta_bc > mean_null * 2 and mean_delta_bc > 0.001
 
     if per_attn_effective:
         verdict = "PER_ATTN_ALIVE"
         summary = (
-            f"per_attn IS working. Prior changes action by {delta_ab:.6f}. "
-            f"No bypass needed."
+            f"per_attn IS working. Paired A→B={mean_delta_ab:.6f} vs "
+            f"noise floor={mean_null:.6f} (SNR={snr_ab:.1f}x)."
         )
     elif bypass_effective:
         verdict = "PER_ATTN_DEAD_BYPASS_WORKS"
         summary = (
-            f"per_attn is dead (A→B delta={delta_ab:.6f}). "
-            f"BUT bypass works (A→C delta={delta_ac:.6f}). "
-            f"Use per_token_cond_scale > 0."
+            f"per_attn dead (A→B={mean_delta_ab:.6f}, noise={mean_null:.6f}, "
+            f"SNR={snr_ab:.1f}x). BUT bypass works (A→C={mean_delta_ac:.6f}, "
+            f"SNR={snr_ac:.1f}x). Use per_token_cond_scale > 0."
         )
     else:
         verdict = "BOTH_DEAD"
         summary = (
-            f"per_attn dead (delta={delta_ab:.6f}), "
-            f"bypass also ineffective (delta={delta_ac:.6f}). "
-            f"per_token has no path to DiT. Try SpatialGatingControl."
+            f"Both paths inactive. A→B={mean_delta_ab:.6f}, A→C={mean_delta_ac:.6f}, "
+            f"noise floor={mean_null:.6f}. Signal ≤ noise. "
+            f"per_token has no path to DiT."
         )
 
     return {
-        "conditions": [cond_a, cond_b, cond_c],
-        "delta_action_AB": delta_ab,
-        "delta_action_AC": delta_ac,
-        "delta_action_BC": delta_bc,
-        "delta_conf_AB": conf_delta_ab,
-        "delta_conf_AC": conf_delta_ac,
+        "per_seed": per_seed_results,
+        "mean_delta_AB": mean_delta_ab,
+        "mean_delta_AC": mean_delta_ac,
+        "mean_delta_BC": mean_delta_bc,
+        "null_baseline": mean_null,
+        "null_deltas": null_deltas,
+        "snr_AB": snr_ab,
+        "snr_AC": snr_ac,
         "per_attn_effective": per_attn_effective,
         "bypass_effective": bypass_effective,
+        "bypass_adds_over_per_attn": bypass_adds_over_per_attn,
         "verdict": verdict,
         "summary": summary,
         "level": 3,
@@ -432,31 +459,45 @@ def run_full_3level_diagnostics(
     print(f"  >> {lv2['summary']}")
     print()
 
-    # ── Level 3: Output sensitivity ──
+    # ── Level 3: Paired-seed output sensitivity ──
     print("=" * 60)
-    print("  Level 3: Output Sensitivity (per_token on/off)")
+    print("  Level 3: Paired-Seed Output Sensitivity")
     print("=" * 60)
-    print("  Running 3 conditions × 2 repeats (DDIM 10 steps) ...")
+    print("  Same seed → same noise → delta = pure per_attn effect")
+    print("  DDIM 10 steps, eta=0 (deterministic given seed)")
+    print()
     lv3 = diagnose_output_sensitivity(
         vla_model, image, instruction,
         unnorm_key=unnorm_key, cfg_scale=cfg_scale,
     )
     results["level3"] = lv3
 
-    for cond in lv3["conditions"]:
-        print(f"  {cond['label']}")
-        print(f"    action[0] = {np.array2string(cond['mean_action'][0], precision=4)}")
-        print(f"    LLM conf  = {cond['mean_conf']:.6f}")
+    print()
+    print("  Per-seed paired deltas:")
+    for r in lv3["per_seed"]:
+        print(
+            f"    seed={r['seed']:5d}:  "
+            f"A→B={r['delta_ab']:.6f}  "
+            f"A→C={r['delta_ac']:.6f}  "
+            f"B→C={r['delta_bc']:.6f}"
+        )
 
     print()
-    print(f"  Action delta A→B (per_attn path) : {lv3['delta_action_AB']:.6f}")
-    print(f"  Action delta A→C (bypass path)   : {lv3['delta_action_AC']:.6f}")
-    print(f"  Action delta B→C (bypass adds)   : {lv3['delta_action_BC']:.6f}")
-    print(f"  Conf   delta A→B                 : {lv3['delta_conf_AB']:.6f}")
-    print(f"  Conf   delta A→C                 : {lv3['delta_conf_AC']:.6f}")
+    print(f"  Null baseline (A vs A, different seeds):")
+    for i, nd in enumerate(lv3["null_deltas"]):
+        print(f"    pair {i}: {nd:.6f}")
+    print(f"    mean noise floor = {lv3['null_baseline']:.6f}")
+
     print()
-    print(f"  per_attn effective? {lv3['per_attn_effective']}")
-    print(f"  bypass effective?   {lv3['bypass_effective']}")
+    print(f"  Mean paired A→B (per_attn signal) : {lv3['mean_delta_AB']:.6f}")
+    print(f"  Mean paired A→C (bypass signal)   : {lv3['mean_delta_AC']:.6f}")
+    print(f"  Mean paired B→C (bypass adds)     : {lv3['mean_delta_BC']:.6f}")
+    print(f"  Noise floor (A vs A)              : {lv3['null_baseline']:.6f}")
+    print(f"  SNR A→B (signal/noise)            : {lv3['snr_AB']:.1f}x")
+    print(f"  SNR A→C (signal/noise)            : {lv3['snr_AC']:.1f}x")
+    print()
+    print(f"  per_attn effective? {lv3['per_attn_effective']}  (need SNR > 2x)")
+    print(f"  bypass effective?   {lv3['bypass_effective']}  (need SNR > 2x)")
     print(f"  Verdict: {lv3['verdict']}")
     print(f"  >> {lv3['summary']}")
     print()
@@ -472,12 +513,14 @@ def run_full_3level_diagnostics(
 
     if lv3["verdict"] == "PER_ATTN_ALIVE":
         print("  Conclusion: per_attn works. Latent L can reach DiT normally.")
+        print(f"  (Signal {lv3['snr_AB']:.1f}x above noise floor)")
     elif lv3["verdict"] == "PER_ATTN_DEAD_BYPASS_WORKS":
         print("  Conclusion: per_attn is dead BUT bypass works.")
         print("  Action: set per_token_cond_scale > 0 (e.g., 0.1~0.2)")
+        print(f"  (Bypass signal {lv3['snr_AC']:.1f}x above noise floor)")
     else:
-        print("  Conclusion: both paths inactive.")
-        print("  Action: use SpatialGatingControl to override per_attn.")
+        print("  Conclusion: both paths inactive. Signal ≤ noise floor.")
+        print("  Action: per_token has no effect via any path.")
     print()
 
     results["recommendation"] = lv3["verdict"]

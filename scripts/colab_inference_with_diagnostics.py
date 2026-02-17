@@ -267,7 +267,7 @@ def diagnose_output_sensitivity(
     instruction: str,
     unnorm_key: str = "libero_spatial_no_noops",
     cfg_scale: float = 1.5,
-    n_repeats: int = 3,
+    n_repeats: int = 2,
 ) -> dict:
     """
     Level 3: End-to-end test. Change per_token, observe action change.
@@ -280,6 +280,8 @@ def diagnose_output_sensitivity(
     If A≈B → per_attn path is dead (prior has no effect)
     If B≈C → bypass adds nothing (per_attn already works)
     If A≈B but A≠C → per_attn dead, but bypass works → use bypass
+
+    Uses DDIM (10 steps) instead of DDPM (1000 steps) for ~100x speedup.
     """
     device = next(vla_model.parameters()).device
     per_dim = vla_model.per_token_size
@@ -287,15 +289,22 @@ def diagnose_output_sensitivity(
     # Generate a fixed random prior
     random_prior = torch.randn(1, per_dim, device=device) * 0.5
 
+    total_calls = n_repeats * 3
+    call_count = [0]
+
     def _run(prior, strength, cond_scale, label):
         all_actions = []
         all_confs = []
         for _ in range(n_repeats):
+            call_count[0] += 1
+            print(f"    [{call_count[0]}/{total_calls}] {label} ...", flush=True)
             acts, _, conf = vla_model.predict_action(
                 image=image,
                 instruction=instruction,
                 unnorm_key=unnorm_key,
                 cfg_scale=cfg_scale,
+                use_ddim=True,
+                num_ddim_steps=10,
                 episode_first_frame="True",
                 per_token_prior=prior,
                 per_token_prior_strength=strength,
@@ -427,7 +436,7 @@ def run_full_3level_diagnostics(
     print("=" * 60)
     print("  Level 3: Output Sensitivity (per_token on/off)")
     print("=" * 60)
-    print("  Running 3 conditions × 3 repeats ...")
+    print("  Running 3 conditions × 2 repeats (DDIM 10 steps) ...")
     lv3 = diagnose_output_sensitivity(
         vla_model, image, instruction,
         unnorm_key=unnorm_key, cfg_scale=cfg_scale,

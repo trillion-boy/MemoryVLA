@@ -30,6 +30,23 @@ import torch
 from PIL import Image
 
 
+def _patch_torch_load():
+    """PyTorch 2.6+ changed torch.load default to weights_only=True.
+    LIBERO init_states are pickled numpy arrays, which fail with this.
+    Monkey-patch torch.load to default weights_only=False."""
+    import functools
+    _original = torch.load
+    if getattr(_original, "_patched_for_libero", False):
+        return
+    @functools.wraps(_original)
+    def _patched_load(*args, **kwargs):
+        if "weights_only" not in kwargs:
+            kwargs["weights_only"] = False
+        return _original(*args, **kwargs)
+    _patched_load._patched_for_libero = True
+    torch.load = _patched_load
+
+
 def _ensure_libero_imports():
     """Lazy-import LIBERO utilities (handles sys.path for Colab)."""
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -43,6 +60,9 @@ def _ensure_libero_imports():
     eval_libero_dir = os.path.join(repo_root, "evaluation", "libero")
     if eval_libero_dir not in sys.path:
         sys.path.insert(0, eval_libero_dir)
+
+    # Fix PyTorch 2.6+ vs LIBERO pickle incompatibility
+    _patch_torch_load()
 
     # Suppress TF GPU (avoids conflict with PyTorch)
     import tensorflow as tf

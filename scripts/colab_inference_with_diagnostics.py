@@ -101,8 +101,11 @@ def diagnose_per_attn(vla_model) -> dict:
         }
         report["blocks"].append(block_info)
 
-        # Threshold: if mean abs weight > 0.01, consider alive
-        if in_mean > 0.01 or out_mean > 0.01:
+        # in_proj is the bottleneck: it projects inputs to Q/K/V.
+        # If in_proj ≈ 0, the cross-attention output is ≈ 0 regardless
+        # of out_proj. Zero-init starts at 0.0; values < 0.005 mean
+        # the weights barely moved during training → functionally dead.
+        if in_mean > 0.005:
             report["is_dead"] = False
 
     if not has_per_attn:
@@ -110,7 +113,7 @@ def diagnose_per_attn(vla_model) -> dict:
         report["summary"] = "No per_attn found in DiT blocks (use_per_attn=False)."
     elif report["is_dead"]:
         report["summary"] = (
-            "per_attn is DEAD (weights near zero). "
+            "per_attn is DEAD (in_proj ≈ 0, zero-init barely moved). "
             "per_token (visual spatial info + Latent L) is NOT reaching DiT. "
             "Consider: (1) enable per_token_cond_scale > 0 as bypass, or "
             "(2) use SpatialGatingControl to override per_attn."

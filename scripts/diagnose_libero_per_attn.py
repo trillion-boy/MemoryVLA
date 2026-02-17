@@ -32,11 +32,15 @@ from PIL import Image
 
 def _ensure_libero_imports():
     """Lazy-import LIBERO utilities (handles sys.path for Colab)."""
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+    # Add third_libs/LIBERO to path (editable install may not be visible to Colab kernel)
+    libero_dir = os.path.join(repo_root, "third_libs", "LIBERO")
+    if os.path.isdir(libero_dir) and libero_dir not in sys.path:
+        sys.path.insert(0, libero_dir)
+
     # Add evaluation/libero to path for libero_utils
-    eval_libero_dir = os.path.join(
-        os.path.dirname(__file__), "..", "evaluation", "libero"
-    )
-    eval_libero_dir = os.path.abspath(eval_libero_dir)
+    eval_libero_dir = os.path.join(repo_root, "evaluation", "libero")
     if eval_libero_dir not in sys.path:
         sys.path.insert(0, eval_libero_dir)
 

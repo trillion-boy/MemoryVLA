@@ -1,48 +1,48 @@
 """
-LIBERO environment per_attn diagnostic script.
+LIBERO in-domain per_attn diagnostic.
 
-Loads a LIBERO spatial task, captures initial observation images,
-and runs the 3-level per_attn diagnostics to verify whether
-per_attn is alive in-domain (LIBERO ckpt + LIBERO env).
+Loads a LIBERO spatial task, captures initial observation,
+and runs 3-level per_attn diagnostics to determine whether
+per_attn is inherently dead (training issue) vs killed by domain shift.
 
-Usage (from repo root):
-    export MUJOCO_GL='osmesa'
-    python scripts/diagnose_libero_per_attn.py \
-        --model_path <path_to_ckpt> \
-        --task_suite_name libero_spatial \
-        --task_id 0
+Usage (Colab):
+    import os
+    os.environ["MUJOCO_GL"] = "osmesa"
 
-Compares with cross-domain (Maniskill) results to determine if
-per_attn is inherently dead vs killed by domain shift.
+    from scripts.diagnose_libero_per_attn import (
+        capture_libero_observation,
+        run_libero_diagnostics,
+    )
+
+    # If model is already loaded:
+    result = run_libero_diagnostics(vla_model=vla)
+
+    # If model needs loading:
+    result = run_libero_diagnostics(model_path="/path/to/ckpt")
 """
 from __future__ import annotations
 
-import argparse
 import os
 import sys
-
-os.environ["MUJOCO_GL"] = "osmesa"
 
 import numpy as np
 import torch
 from PIL import Image
 
-# LIBERO imports
-from libero.libero import benchmark
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "evaluation", "libero"))
-from libero_utils import get_libero_env, get_libero_image, quat2axisangle
 
-# MemoryVLA imports
-from vla.load import load_vla
-from scripts.colab_inference_with_diagnostics import (
-    diagnose_per_attn_weights,
-    diagnose_per_attn_activation,
-    diagnose_output_sensitivity,
-)
+def _ensure_libero_imports():
+    """Lazy-import LIBERO utilities (handles sys.path for Colab)."""
+    # Add evaluation/libero to path for libero_utils
+    eval_libero_dir = os.path.join(
+        os.path.dirname(__file__), "..", "evaluation", "libero"
+    )
+    eval_libero_dir = os.path.abspath(eval_libero_dir)
+    if eval_libero_dir not in sys.path:
+        sys.path.insert(0, eval_libero_dir)
 
-# Suppress TF GPU usage (avoids conflict with PyTorch)
-import tensorflow as tf
-tf.config.set_visible_devices([], "GPU")
+    # Suppress TF GPU (avoids conflict with PyTorch)
+    import tensorflow as tf
+    tf.config.set_visible_devices([], "GPU")
 
 
 def capture_libero_observation(
@@ -54,8 +54,15 @@ def capture_libero_observation(
 ):
     """
     Initialize a LIBERO env, reset to initial state, wait for stabilization,
-    and return (pil_image, task_description, raw_obs).
+    and return (pil_image, task_description).
+
+    The image goes through the exact same preprocessing as eval_libero.py:
+    180-degree rotation → JPEG encode/decode → lanczos3 resize.
     """
+    _ensure_libero_imports()
+    from libero.libero import benchmark
+    from libero_utils import get_libero_env, get_libero_image
+
     print(f"\n{'='*60}")
     print(f"  Capturing LIBERO observation")
     print(f"  Suite: {task_suite_name}, Task: {task_id}, Episode: {episode_idx}")
@@ -73,77 +80,107 @@ def capture_libero_observation(
     env.reset()
     obs = env.set_init_state(initial_states[episode_idx])
 
-    # Wait for objects to stabilize
+    # Wait for objects to stabilize (same as eval_libero.py)
     for _ in range(num_steps_wait):
         obs, _, _, _ = env.step([0, 0, 0, 0, 0, 0, -1])
 
-    # Get preprocessed image (same pipeline as eval_libero.py)
+    # Preprocess image (identical pipeline to eval_libero.py)
     img_np = get_libero_image(obs, resolution)
     pil_image = Image.fromarray(img_np)
     print(f"  Image shape: {img_np.shape}, dtype: {img_np.dtype}")
     print(f"  Instruction: \"{task_description}\"")
 
     env.close()
-    return pil_image, task_description, obs
+    return pil_image, task_description
 
 
 def run_libero_diagnostics(
-    model_path: str,
+    vla_model=None,
+    model_path: str = None,
     task_suite_name: str = "libero_spatial",
     task_id: int = 0,
     episode_idx: int = 0,
     unnorm_key: str = "libero_spatial_no_noops",
     cfg_scale: float = 1.5,
 ):
-    """Run full 3-level diagnostics with a LIBERO observation."""
+    """
+    Run full 3-level diagnostics with a LIBERO observation.
 
-    # Step 1: Capture LIBERO observation
-    pil_image, task_description, raw_obs = capture_libero_observation(
+    Args:
+        vla_model: Already-loaded MemoryVLA model (preferred in Colab).
+        model_path: Path to checkpoint. Used only if vla_model is None.
+        task_suite_name: LIBERO task suite name.
+        task_id: Task index within suite.
+        episode_idx: Initial state / episode index.
+        unnorm_key: Unnormalization key for action decoding.
+        cfg_scale: Classifier-free guidance scale.
+
+    Returns:
+        dict with level1/level2/level3 results and recommendation.
+    """
+    from scripts.colab_inference_with_diagnostics import (
+        diagnose_per_attn_weights,
+        diagnose_per_attn_activation,
+        diagnose_output_sensitivity,
+    )
+
+    # --- Step 1: Capture LIBERO observation ---
+    pil_image, task_description = capture_libero_observation(
         task_suite_name=task_suite_name,
         task_id=task_id,
         episode_idx=episode_idx,
     )
 
-    # Step 2: Load model
-    print(f"\n{'='*60}")
-    print(f"  Loading model from: {model_path}")
-    print(f"{'='*60}")
-    vla = load_vla(model_path)
-    vla.eval()
-    device = next(vla.parameters()).device
-    print(f"  Device: {device}")
+    # --- Step 2: Get model ---
+    if vla_model is None:
+        assert model_path is not None, "Provide either vla_model or model_path"
+        from vla.load import load_vla
+        print(f"\n  Loading model from: {model_path}")
+        vla_model = load_vla(model_path)
+    vla_model.eval()
+    print(f"  Device: {next(vla_model.parameters()).device}")
 
-    # Step 3: Run diagnostics
+    # --- Step 3: Run 3-level diagnostics ---
     results = {}
 
-    # --- Level 1: Weight magnitude ---
+    # Level 1
     print(f"\n{'='*60}")
     print(f"  Level 1: Weight Magnitude")
     print(f"{'='*60}")
-    lv1 = diagnose_per_attn_weights(vla)
+    lv1 = diagnose_per_attn_weights(vla_model)
     results["level1"] = lv1
     for b in lv1["blocks"][:3]:
-        print(f"  Block {b['block_idx']:2d}: in_proj mean={b['in_proj_mean_abs']:.6f} max={b['in_proj_max_abs']:.6f}  risk={b['risk']}")
+        print(
+            f"  Block {b['block_idx']:2d}: "
+            f"in_proj mean={b['in_proj_mean_abs']:.6f} "
+            f"max={b['in_proj_max_abs']:.6f}  "
+            f"risk={b['risk']}"
+        )
     if len(lv1["blocks"]) > 3:
         print(f"  ... ({len(lv1['blocks'])} blocks total)")
     print(f"  Verdict: {lv1['verdict']}")
     print(f"  >> {lv1['summary']}")
 
-    # --- Level 2: Activation ratio ---
+    # Level 2
     print(f"\n{'='*60}")
     print(f"  Level 2: Activation Ratio ||x_c|| / ||x||")
     print(f"{'='*60}")
-    lv2 = diagnose_per_attn_activation(vla)
+    lv2 = diagnose_per_attn_activation(vla_model)
     results["level2"] = lv2
     for r in lv2["ratios"][:3]:
-        print(f"  Block {r['block_idx']:2d}: ||x_c||={r['x_c_norm']:.6f}  ||x||={r['x_norm']:.2f}  ratio={r['ratio']:.2e}")
+        print(
+            f"  Block {r['block_idx']:2d}: "
+            f"||x_c||={r['x_c_norm']:.6f}  "
+            f"||x||={r['x_norm']:.2f}  "
+            f"ratio={r['ratio']:.2e}"
+        )
     if len(lv2["ratios"]) > 3:
         print(f"  ... ({len(lv2['ratios'])} blocks total)")
     print(f"  Mean ratio: {lv2['mean_ratio']:.2e}")
     print(f"  Verdict: {lv2['verdict']}")
     print(f"  >> {lv2['summary']}")
 
-    # --- Level 3: Paired-seed output sensitivity (LIBERO image) ---
+    # Level 3 (with LIBERO image)
     print(f"\n{'='*60}")
     print(f"  Level 3: Paired-Seed Output Sensitivity (LIBERO image)")
     print(f"{'='*60}")
@@ -152,7 +189,7 @@ def run_libero_diagnostics(
     print()
 
     lv3 = diagnose_output_sensitivity(
-        vla, pil_image, task_description,
+        vla_model, pil_image, task_description,
         unnorm_key=unnorm_key, cfg_scale=cfg_scale,
     )
     results["level3"] = lv3
@@ -160,7 +197,12 @@ def run_libero_diagnostics(
     print()
     print("  Per-seed paired deltas:")
     for r in lv3["per_seed"]:
-        print(f"    seed={r['seed']:5d}:  A→B={r['delta_ab']:.6f}  A→C={r['delta_ac']:.6f}  B→C={r['delta_bc']:.6f}")
+        print(
+            f"    seed={r['seed']:5d}:  "
+            f"A→B={r['delta_ab']:.6f}  "
+            f"A→C={r['delta_ac']:.6f}  "
+            f"B→C={r['delta_bc']:.6f}"
+        )
 
     print()
     print(f"  Null baseline (A vs A, different seeds):")
@@ -204,23 +246,3 @@ def run_libero_diagnostics(
     results["task_id"] = task_id
     results["recommendation"] = lv3["verdict"]
     return results
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="LIBERO per_attn diagnostics")
-    parser.add_argument("--model_path", type=str, required=True, help="Path to MemoryVLA checkpoint")
-    parser.add_argument("--task_suite_name", type=str, default="libero_spatial", help="LIBERO task suite")
-    parser.add_argument("--task_id", type=int, default=0, help="Task ID within suite")
-    parser.add_argument("--episode_idx", type=int, default=0, help="Episode/initial state index")
-    parser.add_argument("--unnorm_key", type=str, default="libero_spatial_no_noops", help="Unnormalization key")
-    parser.add_argument("--cfg_scale", type=float, default=1.5, help="Classifier-free guidance scale")
-    args = parser.parse_args()
-
-    results = run_libero_diagnostics(
-        model_path=args.model_path,
-        task_suite_name=args.task_suite_name,
-        task_id=args.task_id,
-        episode_idx=args.episode_idx,
-        unnorm_key=args.unnorm_key,
-        cfg_scale=args.cfg_scale,
-    )

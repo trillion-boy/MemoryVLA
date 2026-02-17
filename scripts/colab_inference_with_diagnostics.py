@@ -161,15 +161,21 @@ def diagnose_per_attn_activation(vla_model) -> dict:
 
     B = 1
     T = dit.future_action_window_size + 1
-    D = dit.blocks[0].attn.qkv.weight.shape[0] // 3  # hidden_size
 
-    # Create dummy inputs
+    # Create dummy inputs with correct dimensions
     noise_action = torch.randn(B, T, dit.in_channels, device=device, dtype=dtype)
     t = torch.tensor([50], device=device)
-    cog = torch.randn(B, 1, dit.x_embedder.linear.weight.shape[0], device=device, dtype=dtype)
 
-    per_token_dim = dit.per_token_embedder.linear.weight.shape[1] if dit.use_per_attn else 256
-    per_token = torch.randn(B, 256, per_token_dim, device=device, dtype=dtype)
+    # z_embedder expects (B, 1, token_size) where token_size = LLaMA dim (4096)
+    cog_dim = dit.z_embedder.linear.in_features  # token_size, NOT hidden_size
+    cog = torch.randn(B, 1, cog_dim, device=device, dtype=dtype)
+
+    # per_token_embedder expects (B, seq_len, per_token_size)
+    if dit.use_per_attn:
+        per_token_dim = dit.per_token_embedder.linear.in_features
+        per_token = torch.randn(B, 256, per_token_dim, device=device, dtype=dtype)
+    else:
+        per_token = None
 
     # Hook into each DiTBlock to capture ||x_c|| and ||x||
     activation_ratios = []

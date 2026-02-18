@@ -23,7 +23,7 @@
 
 ### 1.1 목표
 
-LIBERO에서 학습된 MemoryVLA checkpoint를 ManiSkill2 환경에서 사용할 때, **spatial grounding** (특정 물체 위치에 action을 집중시키는 능력)을 부여하려 했다. ControlMLLM 논문의 접근법을 참고하여, per_token (시각적 패치 특징)에 공간 prior L을 주입하면 per_attn (cross-attention)이 해당 영역에 집중할 것으로 기대했다.
+LIBERO에서 학습된 MemoryVLA checkpoint를 ManiSkill2 환경에서 사용할 때, **spatial grounding** (특정 물체 위치에 action을 집중시키는 능력)을 부여하려 했다. 핵심 아이디어는 **zero-initialized latent variable L**을 per_token에 주입하여, 학습을 통해 per_attn (cross-attention)이 공간적으로 의미있는 패턴을 형성하도록 유도하는 것이었다.
 
 ### 1.2 아키텍처 개요
 
@@ -31,7 +31,7 @@ LIBERO에서 학습된 MemoryVLA checkpoint를 ManiSkill2 환경에서 사용할
 Vision Backbone (DINO V2 + SigLIP)
         │
         ▼  [B, 256, vision_dim]
-   SE Bottleneck (per_compr)         ← (1) Spatial Prior L 주입 후보 지점
+   SE Bottleneck (per_compr)         ← (1) Zero-init Latent L 주입 후보 지점
         │
         ▼  [B, 256, 256]
    Memory Bank (per_mem_bank)
@@ -57,7 +57,7 @@ Vision Backbone (DINO V2 + SigLIP)
 
 ### 2.1 L 주입 지점 결정
 
-Spatial prior L (예: SAM 마스크 → 16×16 패치 그리드)을 어디에 넣을지 탐색했다. 후보는 두 곳이었다:
+Zero-initialized latent variable L을 어디에 넣을지 탐색했다. L은 per_token과 동일한 shape의 학습 가능한 잠재 변수로, 0에서 시작하여 학습/최적화를 통해 공간 정보를 인코딩하게 된다. 후보는 두 곳이었다:
 
 | 후보 | 위치 | 장단점 |
 |------|------|--------|
@@ -313,16 +313,16 @@ for step in range(T):
 
 **커밋 기록:** `6d74aa5` (구현) → `2c8a81d` (dead 발견으로 폐기)
 
-### 6.2 시도 2: SpatialGatingControl — 성공 (Method A)
+### 6.2 시도 2: SpatialGatingControl — per_attn 우회 (Method A)
 
-**개념:** dead per_attn을 통째로 교체. SAM 마스크를 직접 attention weight으로 사용.
+**개념:** dead per_attn을 통째로 교체. 외부에서 제공한 target_grid (바이너리 패치 마스크)를 직접 attention weight으로 사용.
 
 **구현 (`spatial_control.py:77-139`):**
 
 ```python
 @contextmanager
 def spatial_attn_override(self, target_grid):
-    attn_weights = self.compute_spatial_weights(target_grid)  # 마스크 → 정규화된 가중치
+    attn_weights = self.compute_spatial_weights(target_grid)  # 패치 마스크 → 정규화된 가중치
 
     for block in dit.blocks:
         if block.use_per_attn:
@@ -340,13 +340,15 @@ def spatial_attn_override(self, target_grid):
 
 ```python
 def manual_attn(query, key, value):
-    # SAM 마스크 기반 가중합 (query 무시, 학습된 Q/K/V 무시)
+    # 외부 마스크 기반 가중합 (query 무시, 학습된 Q/K/V 무시)
     context = einsum('bn,bnd->bd', attn_weights, value)  # 타겟 영역 per_token의 가중합
     output = context.unsqueeze(1).expand(B, T, D) * scale  # 모든 action token에 broadcast
     return output, None
 ```
 
 **장점:** 최적화 루프 불필요, 즉시 작동, dead weight에 의존하지 않음
+
+**참고:** 이 방법은 per_attn dead 문제를 확인하는 과정에서 만든 임시 우회 전략이며, 최종적으로 우리가 원하는 접근(zero-initialized latent L 학습)과는 별개의 방법이다.
 
 ### 6.3 시도 3: per_token_cond_scale Bypass (Method B)
 
@@ -364,11 +366,11 @@ if per_token_cond_scale > 0.0 and per_token is not None:
 
 ### 6.4 시도 4: Soft Spatial Prior Injection (보조)
 
-**개념:** SE Bottleneck 이후 per_token에 spatial prior를 additive/multiplicative로 주입
+**개념:** SE Bottleneck 이후 per_token에 latent L을 additive/multiplicative로 주입
 
 **구현 (`memory_vla.py:545-570`):** `_apply_per_token_prior()`
 
-**한계:** L을 넣어도 per_attn이 dead이면 DiT까지 도달하지 못함. **Method A (SpatialGatingControl)와 결합해야 의미가 있음.**
+**한계:** L을 넣어도 per_attn이 dead이면 DiT까지 도달하지 못함. **per_attn을 살리거나 우회하는 방법과 반드시 결합해야 의미가 있음.**
 
 ---
 
@@ -389,10 +391,10 @@ if per_token_cond_scale > 0.0 and per_token is not None:
 **현재 상황:**
 
 ```
-vision_feats → SE Bottleneck → L 주입 → per_mem_bank → per_attn(DEAD) → 무시됨
+vision_feats → SE Bottleneck → L(zero-init latent) 주입 → per_mem_bank → per_attn(DEAD) → 무시됨
 ```
 
-L을 아무리 잘 넣어도 per_attn이 0이면 **출력에 반영되지 않는다.** 선택지:
+zero-initialized latent L을 SE Bottleneck 이후에 주입하더라도, per_attn이 0이면 DiT의 action output에 **전혀 반영되지 않는다.** L이 학습/최적화를 통해 의미있는 값을 가지게 되어도 per_attn이라는 병목이 막고 있는 것. 선택지:
 
 | 방안 | 접근 | 리스크 |
 |------|------|--------|

@@ -94,9 +94,19 @@ class ZSPSAConfig:
 
     # -- composite objective --
     w_lang: float = 0.5
-    """Weight for LLM confidence in composite J."""
+    """Weight for LLM confidence in composite J.
+    If prioritizing action execution, increase w_act (e.g., 0.4/0.6)."""
     w_act: float = 0.5
-    """Weight for action trajectory confidence in composite J."""
+    """Weight for action confidence in composite J."""
+    w_traj: float = 0.7
+    """Sub-weight for trajectory certainty within conf_action."""
+    w_smooth: float = 0.3
+    """Sub-weight for intra-trajectory smoothness within conf_action.
+    Smoothness = how smooth the predicted future actions are (no jitter)."""
+    llm_gate_floor: float = 0.3
+    """Soft gate: if conf_llm < this, J is penalized proportionally.
+    Prevents 'baseless confidence' where action looks good but the model
+    doesn't actually understand the instruction/scene."""
     normalize_objectives: bool = True
     """If True, normalize conf_llm and conf_action to comparable scales
     using running statistics from the first few iterations. This prevents
@@ -108,6 +118,9 @@ class ZSPSAConfig:
     """Fraction of denoising steps to use for trajectory confidence."""
     traj_tau: float = 0.1
     """Temperature for trajectory confidence sigmoid."""
+    smooth_tau: float = 0.05
+    """Temperature for smoothness sigmoid: conf = 1/(1 + mean_jerk/tau).
+    Lower = more sensitive to action jitter."""
 
     # -- stability --
     max_L_norm: float = 50.0
@@ -195,6 +208,24 @@ def _ensure_ddim(vla_model, steps=10):
         vla_model.action_model.create_ddim(ddim_step=steps)
 
 
+def _compute_smoothness(norm_actions: np.ndarray, tau: float) -> float:
+    """Compute smoothness confidence from inter-step jitter in action sequence.
+
+    norm_actions: [T, D] or [1, T, D] — the predicted action chunk.
+    Returns scalar in (0, 1]: conf = 1 / (1 + mean_jerk / tau).
+    If T <= 1, returns 1.0 (single-step is trivially smooth).
+    """
+    a = np.asarray(norm_actions)
+    if a.ndim == 3:
+        a = a[0]  # [T, D]
+    if a.shape[0] <= 1:
+        return 1.0
+    # First-order finite differences → "jerk" = mean abs delta
+    diffs = np.diff(a, axis=0)  # [T-1, D]
+    mean_jerk = float(np.abs(diffs).mean())
+    return 1.0 / (1.0 + mean_jerk / tau)
+
+
 @torch.inference_mode()
 def _eval_z_objective(
     vla_model,
@@ -206,11 +237,16 @@ def _eval_z_objective(
     """
     Evaluate composite objective with L_z injected into z pathway.
 
-    J = w_lang * conf_llm + w_act * conf_action
+    J = gate * (w_lang * conf_llm + w_act * conf_action)
+
+    where:
+      conf_action = w_traj * trajectory_certainty + w_smooth * smoothness
+      gate = min(1.0, conf_llm / llm_gate_floor)  — soft penalty when
+             the model doesn't understand the instruction at all.
 
     Returns:
         J: scalar (higher = better)
-        info: dict with conf_llm, conf_action, actions, etc.
+        info: dict with conf_llm, conf_action, actions, raw_actions, etc.
     """
     _ensure_ddim(vla_model, cfg.num_ddim_steps)
 
@@ -243,29 +279,52 @@ def _eval_z_objective(
 
         conf_llm = float(llm_conf.mean())
 
-        # Trajectory consistency confidence
+        # -- Sub-metrics for conf_action --
+        raw_actions = None
         if captured["pred_xstarts"]:
+            # Trajectory certainty (from pred_xstart variance across steps)
             traj = _compute_trajectory_confidence(
                 captured["pred_xstarts"],
                 using_cfg=(cfg.cfg_scale > 1.0),
                 tail_fraction=cfg.traj_tail_fraction,
                 tau=cfg.traj_tau,
             )
-            conf_action = traj["action_confidence"]
+            conf_traj = traj["action_confidence"]
             traj_var = traj["mean_variance"]
+
+            # Raw actions: final pred_xstart before clip/binarize
+            raw_pred = captured["pred_xstarts"][-1]
+            if cfg.cfg_scale > 1.0 and raw_pred.shape[0] > 1:
+                raw_pred = raw_pred[: raw_pred.shape[0] // 2]
+            raw_actions = raw_pred.cpu().numpy()
         else:
-            conf_action = conf_llm
+            conf_traj = conf_llm
             traj_var = 0.0
 
-        J = cfg.w_lang * conf_llm + cfg.w_act * conf_action
+        # Smoothness (from predicted action sequence inter-step jitter)
+        conf_smooth = _compute_smoothness(norm_actions, cfg.smooth_tau)
+
+        # Combine sub-metrics
+        conf_action = cfg.w_traj * conf_traj + cfg.w_smooth * conf_smooth
+
+        # -- Soft gate: penalize when conf_llm is too low --
+        # Prevents "baseless confidence" where action metrics look OK
+        # but the model doesn't actually understand the instruction.
+        gate = min(1.0, conf_llm / cfg.llm_gate_floor)
+
+        J = gate * (cfg.w_lang * conf_llm + cfg.w_act * conf_action)
 
         return J, {
             "conf_llm": conf_llm,
             "conf_action": conf_action,
+            "conf_traj": conf_traj,
+            "conf_smooth": conf_smooth,
             "traj_variance": traj_var,
+            "gate": gate,
             "J": J,
             "actions": actions,
             "norm_actions": norm_actions,
+            "raw_actions": raw_actions,
         }
 
     finally:
@@ -362,6 +421,9 @@ def optimize_z_spsa(
         J_cur = 0.5 * (J_p + J_m)
         raw_llm = 0.5 * (info_p["conf_llm"] + info_m["conf_llm"])
         raw_act = 0.5 * (info_p["conf_action"] + info_m["conf_action"])
+        raw_traj = 0.5 * (info_p["conf_traj"] + info_m["conf_traj"])
+        raw_smooth = 0.5 * (info_p["conf_smooth"] + info_m["conf_smooth"])
+        avg_gate = 0.5 * (info_p["gate"] + info_m["gate"])
         record = {
             "iter": k + 1,
             "J": J_cur,
@@ -369,6 +431,9 @@ def optimize_z_spsa(
             "J_m": J_m,
             "conf_llm": raw_llm,
             "conf_action": raw_act,
+            "conf_traj": raw_traj,
+            "conf_smooth": raw_smooth,
+            "gate": avg_gate,
             "traj_var": 0.5 * (info_p["traj_variance"] + info_m["traj_variance"]),
             "L_norm": L_norm,
             "ak": ak,
@@ -385,10 +450,10 @@ def optimize_z_spsa(
                 f"  [iter {k+1:3d}/{cfg.num_iters}]  "
                 f"J={J_cur:.4f}{norm_tag}  "
                 f"llm={raw_llm:.4f}  "
-                f"act={raw_act:.4f}  "
+                f"act={raw_act:.4f} (traj={raw_traj:.3f} smooth={raw_smooth:.3f})  "
+                f"gate={avg_gate:.2f}  "
                 f"|L|={L_norm:.2f}  "
-                f"jerk={jerk:.4f}  "
-                f"ak={ak:.4f} ck={ck:.4f}"
+                f"jerk={jerk:.4f}"
             )
 
     return L_z.detach(), history
@@ -463,6 +528,9 @@ def calibrate_z_spsa(
         mid = len(J_vals) // 2
         trend_up = np.mean(J_vals[mid:]) > np.mean(J_vals[:mid])
 
+        # Conf_action at end of calibration run
+        end_act = history[-1].get("conf_action", 0.0) if history else 0.0
+
         result = {
             "cfg_scale": cfg_s,
             "c": cal_cfg.c,
@@ -474,6 +542,7 @@ def calibrate_z_spsa(
             "improvement": improvement,
             "L_norm": L_norm,
             "max_jerk": max_jerk,
+            "end_conf_action": end_act,
             "stable": stable,
             "trend_up": trend_up,
             "history": history,
@@ -483,15 +552,35 @@ def calibrate_z_spsa(
         status = "OK" if stable else "UNSTABLE"
         trend = "UP" if trend_up else "flat/down"
         print(f"J: {J_start:.4f} -> {J_end:.4f} ({improvement:+.4f})  "
-              f"|L|={L_norm:.1f}  [{status}, {trend}]")
+              f"|L|={L_norm:.1f}  jerk={max_jerk:.4f}  [{status}, {trend}]")
 
-    # Select best: stable + highest improvement
+    # Select best: Pareto-style multi-criteria scoring
+    # Criteria: improvement (primary), low jerk (stability), conf_action end value
     stable_results = [r for r in all_results if r["stable"]]
     if not stable_results:
         print("\n  WARNING: No stable configurations found. Using least unstable.")
         stable_results = sorted(all_results, key=lambda r: r["L_norm"])[:3]
 
-    best = max(stable_results, key=lambda r: r["improvement"])
+    def _pareto_score(r: dict) -> float:
+        """Multi-criteria score: balance improvement, stability, and action quality."""
+        # Normalize each axis to [0, 1] relative to the candidate set
+        improvements = [s["improvement"] for s in stable_results]
+        jerks = [s["max_jerk"] for s in stable_results]
+        acts = [s["end_conf_action"] for s in stable_results]
+
+        imp_range = max(improvements) - min(improvements) if len(improvements) > 1 else 1.0
+        jerk_range = max(jerks) - min(jerks) if len(jerks) > 1 else 1.0
+        act_range = max(acts) - min(acts) if len(acts) > 1 else 1.0
+
+        norm_imp = (r["improvement"] - min(improvements)) / max(imp_range, 1e-8)
+        # Lower jerk is better → invert
+        norm_jerk = 1.0 - (r["max_jerk"] - min(jerks)) / max(jerk_range, 1e-8)
+        norm_act = (r["end_conf_action"] - min(acts)) / max(act_range, 1e-8)
+
+        # Weighted combination: improvement matters most
+        return 0.5 * norm_imp + 0.2 * norm_jerk + 0.3 * norm_act
+
+    best = max(stable_results, key=_pareto_score)
 
     print()
     print(f"  Best: cfg={best['cfg_scale']:.1f}  "
@@ -560,6 +649,8 @@ def run_phase_b(
     print(f"  J: {J_start:.4f} -> {J_end:.4f} -> final={J_final:.4f}")
     print(f"  conf_llm:    {history[0]['conf_llm']:.4f} -> {info_final['conf_llm']:.4f}")
     print(f"  conf_action: {history[0]['conf_action']:.4f} -> {info_final['conf_action']:.4f}")
+    print(f"    traj:   {info_final['conf_traj']:.4f}  smooth: {info_final['conf_smooth']:.4f}")
+    print(f"  gate:        {info_final['gate']:.3f}")
     print(f"  |L_z|: {history[-1]['L_norm']:.2f}")
     print()
 

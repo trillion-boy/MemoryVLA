@@ -97,6 +97,11 @@ class ZSPSAConfig:
     """Weight for LLM confidence in composite J."""
     w_act: float = 0.5
     """Weight for action trajectory confidence in composite J."""
+    normalize_objectives: bool = True
+    """If True, normalize conf_llm and conf_action to comparable scales
+    using running statistics from the first few iterations. This prevents
+    one metric from dominating the composite objective when their raw
+    scales differ (e.g., conf_llm ≈ 0.95 vs conf_action ≈ 0.3)."""
     confidence_type: str = "max_prob"
     """LLM confidence type: 'max_prob', 'max_logit', 'token_prob'."""
     traj_tail_fraction: float = 0.5
@@ -123,6 +128,54 @@ class ZSPSAConfig:
 # ===================================================================
 # SPSA schedule helpers
 # ===================================================================
+# ===================================================================
+# Objective scale normalizer
+# ===================================================================
+class _RunningNormalizer:
+    """Tracks running mean/std of two signals and normalizes them to [0, 1].
+
+    Solves the scale mismatch problem:
+      conf_llm  might live in [0.85, 0.99]  (narrow, high)
+      conf_action might live in [0.1, 0.5]  (wide, low)
+    Without normalization, J = 0.5*llm + 0.5*act is dominated by llm.
+
+    After warmup (default 4 samples), both signals are z-scored then
+    mapped to [0, 1] via sigmoid, so w_lang and w_act control true
+    relative importance.
+    """
+
+    def __init__(self, warmup: int = 4):
+        self.warmup = warmup
+        self._llm_vals: List[float] = []
+        self._act_vals: List[float] = []
+
+    @property
+    def ready(self) -> bool:
+        return len(self._llm_vals) >= self.warmup
+
+    def update(self, conf_llm: float, conf_action: float):
+        self._llm_vals.append(conf_llm)
+        self._act_vals.append(conf_action)
+
+    def normalize(self, conf_llm: float, conf_action: float) -> Tuple[float, float]:
+        """Return normalized scores in ~[0, 1] with comparable spread."""
+        if not self.ready:
+            return conf_llm, conf_action
+
+        llm_mean = np.mean(self._llm_vals)
+        llm_std = max(np.std(self._llm_vals), 1e-6)
+        act_mean = np.mean(self._act_vals)
+        act_std = max(np.std(self._act_vals), 1e-6)
+
+        # z-score → sigmoid → [0, 1]
+        def _sigmoid(x):
+            return 1.0 / (1.0 + np.exp(-x))
+
+        nlm = _sigmoid((conf_llm - llm_mean) / llm_std)
+        nac = _sigmoid((conf_action - act_mean) / act_std)
+        return float(nlm), float(nac)
+
+
 def _gain_ak(k: int, cfg: ZSPSAConfig) -> float:
     """Step-size: a_k = a / (k + 1 + A)^alpha."""
     return cfg.a / ((k + 1 + cfg.A) ** cfg.alpha)
@@ -261,6 +314,7 @@ def optimize_z_spsa(
 
     history: List[dict] = []
     prev_actions = None
+    normalizer = _RunningNormalizer(warmup=4) if cfg.normalize_objectives else None
 
     for k in range(cfg.num_iters):
         ak = _gain_ak(k, cfg)
@@ -279,6 +333,16 @@ def optimize_z_spsa(
         J_p, info_p = _eval_z_objective(vla_model, image, instruction, L_plus, cfg)
         J_m, info_m = _eval_z_objective(vla_model, image, instruction, L_minus, cfg)
 
+        # Scale normalization: prevent one metric from dominating
+        if normalizer is not None:
+            normalizer.update(info_p["conf_llm"], info_p["conf_action"])
+            normalizer.update(info_m["conf_llm"], info_m["conf_action"])
+            if normalizer.ready:
+                nlm_p, nac_p = normalizer.normalize(info_p["conf_llm"], info_p["conf_action"])
+                nlm_m, nac_m = normalizer.normalize(info_m["conf_llm"], info_m["conf_action"])
+                J_p = cfg.w_lang * nlm_p + cfg.w_act * nac_p
+                J_m = cfg.w_lang * nlm_m + cfg.w_act * nac_m
+
         # SPSA gradient estimate (ascent → maximize J)
         ghat = ((J_p - J_m) / (2.0 * ck)) * delta
 
@@ -296,13 +360,15 @@ def optimize_z_spsa(
         prev_actions = cur_actions
 
         J_cur = 0.5 * (J_p + J_m)
+        raw_llm = 0.5 * (info_p["conf_llm"] + info_m["conf_llm"])
+        raw_act = 0.5 * (info_p["conf_action"] + info_m["conf_action"])
         record = {
             "iter": k + 1,
             "J": J_cur,
             "J_p": J_p,
             "J_m": J_m,
-            "conf_llm": 0.5 * (info_p["conf_llm"] + info_m["conf_llm"]),
-            "conf_action": 0.5 * (info_p["conf_action"] + info_m["conf_action"]),
+            "conf_llm": raw_llm,
+            "conf_action": raw_act,
             "traj_var": 0.5 * (info_p["traj_variance"] + info_m["traj_variance"]),
             "L_norm": L_norm,
             "ak": ak,
@@ -312,11 +378,14 @@ def optimize_z_spsa(
         history.append(record)
 
         if cfg.verbose:
+            norm_tag = ""
+            if normalizer is not None and normalizer.ready:
+                norm_tag = " [normalized]"
             print(
                 f"  [iter {k+1:3d}/{cfg.num_iters}]  "
-                f"J={J_cur:.4f}  "
-                f"llm={record['conf_llm']:.4f}  "
-                f"act={record['conf_action']:.4f}  "
+                f"J={J_cur:.4f}{norm_tag}  "
+                f"llm={raw_llm:.4f}  "
+                f"act={raw_act:.4f}  "
                 f"|L|={L_norm:.2f}  "
                 f"jerk={jerk:.4f}  "
                 f"ak={ak:.4f} ck={ck:.4f}"

@@ -1,18 +1,19 @@
 """
-cog_attn (z pathway) 진단 스크립트.
+cog_attn (z pathway) 진단 스크립트 v2.
 
-per_attn이 dead인 것을 확인한 후, L을 z(cog_tokens) 경로에 넣으려면
-이 경로가 실제로 반응하는지 먼저 확인해야 한다.
+v1 대비 개선사항 (비판 반영):
+  1. 결정론적 바닥(same-seed repeat)과 cross-seed 분산을 분리
+  2. raw (pre-clip/binarize) + final action 이중 출력 공간 측정
+  3. perturbation scale sweep (dose-response 곡선)
+  4. CFG scale sweep
+  5. 내용 민감도 테스트 (z=0 vs z_real vs z_shuffled vs z+δ)
 
-DiT 아키텍처에서 cog_tokens는:
-  z_embedder(z) → c = t + z → cat(c, action_tokens) → self-attention
-self-attention(cog_attn)은 Xavier init이라 살아있을 것으로 예상하지만,
-실제 checkpoint에서 확인이 필요하다.
-
-3-Level 진단:
-  Level 1: self-attention weight magnitude (Xavier init 확인)
-  Level 2: z 경로 activation ratio (condition token의 기여도)
-  Level 3: paired-seed z perturbation test (가장 결정적)
+v1 Level 3의 문제점:
+  - predict_action 후처리(clip, gripper 이진화)가 delta를 축소
+  - cross-seed A/A를 noise floor로 사용하면 과대추정
+  - 단일 perturbation scale(0.1)로는 dead vs weak 구분 불가
+  - CFG가 z 신호를 증폭하는지 미확인
+  - z on/off vs z content 구분 불가
 
 Usage (Colab):
     from scripts.diagnose_cog_attn import run_cog_attn_diagnostics
@@ -167,141 +168,407 @@ def diagnose_z_activation(vla_model) -> dict:
 
 
 # ===================================================================
-# Level 3: Paired-seed z perturbation test (most definitive)
+# Level 3 Enhanced: z pathway sensitivity (v2)
+# ===================================================================
+
+def _ensure_ddim(vla_model, steps=10):
+    """Pre-create DDIM so hooks on ddim_sample_loop work reliably."""
+    if vla_model.action_model.ddim_diffusion is None:
+        vla_model.action_model.create_ddim(ddim_step=steps)
+
+
+@torch.inference_mode()
+def _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed,
+                cog_patch_fn=None):
+    """
+    Run predict_action and capture BOTH:
+      - raw:   pre-clip/binarize (normalized space, direct diffusion output)
+      - final: post-clip/binarize/unnorm (action space)
+
+    cog_patch_fn: optional f(cog_tokens) -> modified cog_tokens.
+                  Applied after memory bank, before DiT.
+    """
+    _ensure_ddim(vla_model)
+
+    # ── Hook 1: cog_tokens patching ──
+    original_process = vla_model.cog_mem_bank.process_batch
+    if cog_patch_fn is not None:
+        def patched_process(*args, **kwargs):
+            result = original_process(*args, **kwargs)
+            return cog_patch_fn(result)
+        vla_model.cog_mem_bank.process_batch = patched_process
+
+    # ── Hook 2: capture raw diffusion output (before clip/binarize) ──
+    raw_holder = {}
+    ddim = vla_model.action_model.ddim_diffusion
+    original_loop = ddim.ddim_sample_loop
+
+    def capture_loop(*args, **kwargs):
+        result = original_loop(*args, **kwargs)
+        raw_holder['samples'] = result.detach().cpu().clone()
+        return result
+    ddim.ddim_sample_loop = capture_loop
+
+    try:
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        final_actions, _, _ = vla_model.predict_action(
+            image=image, instruction=instruction,
+            unnorm_key=unnorm_key, cfg_scale=cfg_scale,
+            use_ddim=True, num_ddim_steps=10,
+            episode_first_frame="True",
+            return_confidence=True, confidence_type="max_prob",
+        )
+
+        raw = raw_holder.get('samples')
+        if raw is not None:
+            if cfg_scale > 1.0:
+                raw, _ = raw.chunk(2, dim=0)
+            raw_actions = raw[0].numpy()
+        else:
+            raw_actions = final_actions.copy()
+
+        return {'raw': raw_actions, 'final': final_actions}
+    finally:
+        vla_model.cog_mem_bank.process_batch = original_process
+        ddim.ddim_sample_loop = original_loop
+
+
+# -------------------------------------------------------------------
+#  Sub-test 3a: Deterministic reproducibility floor
+# -------------------------------------------------------------------
+@torch.inference_mode()
+def _test_3a_deterministic_floor(vla_model, image, instruction, unnorm_key,
+                                  cfg_scale, seed=42):
+    """Same seed, same z, run twice. If DDIM eta=0 is truly deterministic,
+    delta should be ~0.  This is the TRUE noise floor (not cross-seed)."""
+    r1 = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed)
+    r2 = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed)
+    return {
+        'delta_raw':  float(np.abs(r1['raw']  - r2['raw']).mean()),
+        'delta_final': float(np.abs(r1['final'] - r2['final']).mean()),
+        'max_raw':     float(np.abs(r1['raw']  - r2['raw']).max()),
+    }
+
+
+# -------------------------------------------------------------------
+#  Sub-test 3b: Perturbation scale sweep (dose-response)
+# -------------------------------------------------------------------
+@torch.inference_mode()
+def _test_3b_perturbation_sweep(vla_model, image, instruction, unnorm_key,
+                                 cfg_scale, seed=42,
+                                 scales=(0.03, 0.1, 0.3, 1.0)):
+    """Fixed direction, varying magnitude. Monotonic increase → alive."""
+    device = next(vla_model.parameters()).device
+    cog_dim = vla_model.action_model.net.z_embedder.linear.in_features
+
+    gen = torch.Generator(device=device).manual_seed(7777)
+    direction = torch.randn(1, 1, cog_dim, device=device, generator=gen)
+    direction = direction / direction.norm()  # unit vector
+
+    baseline = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed)
+
+    sweep = []
+    for scale in scales:
+        p = direction * scale
+        patch_fn = lambda z, _p=p: z + _p.to(z.device, dtype=z.dtype)
+        r = _run_one_v2(vla_model, image, instruction, unnorm_key,
+                        cfg_scale, seed, cog_patch_fn=patch_fn)
+        sweep.append({
+            'scale': scale,
+            'delta_raw':  float(np.abs(baseline['raw']  - r['raw']).mean()),
+            'delta_final': float(np.abs(baseline['final'] - r['final']).mean()),
+            'max_delta_raw': float(np.abs(baseline['raw'] - r['raw']).max()),
+        })
+
+    raw_deltas = [s['delta_raw'] for s in sweep]
+    is_monotonic = all(raw_deltas[i] <= raw_deltas[i+1] * 1.05
+                       for i in range(len(raw_deltas) - 1))
+
+    return {
+        'baseline_first': baseline['raw'][0].tolist() if baseline['raw'].ndim > 1
+                          else baseline['raw'].tolist(),
+        'sweep': sweep,
+        'is_monotonic': is_monotonic,
+    }
+
+
+# -------------------------------------------------------------------
+#  Sub-test 3c: CFG scale sweep
+# -------------------------------------------------------------------
+@torch.inference_mode()
+def _test_3c_cfg_sweep(vla_model, image, instruction, unnorm_key,
+                        seed=42, perturbation_scale=0.1,
+                        cfg_scales=(1.0, 1.5, 3.0)):
+    """Higher CFG should amplify conditional signal ⇒ amplify z effect."""
+    device = next(vla_model.parameters()).device
+    cog_dim = vla_model.action_model.net.z_embedder.linear.in_features
+
+    gen = torch.Generator(device=device).manual_seed(7777)
+    direction = torch.randn(1, 1, cog_dim, device=device, generator=gen)
+    direction = direction / direction.norm()
+    p = direction * perturbation_scale
+    patch_fn = lambda z, _p=p: z + _p.to(z.device, dtype=z.dtype)
+
+    results = []
+    for cfg in cfg_scales:
+        b = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg, seed)
+        r = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg, seed,
+                        cog_patch_fn=patch_fn)
+        results.append({
+            'cfg': cfg,
+            'delta_raw':  float(np.abs(b['raw']  - r['raw']).mean()),
+            'delta_final': float(np.abs(b['final'] - r['final']).mean()),
+        })
+
+    cfg_amplifies = (len(results) >= 2 and
+                     results[-1]['delta_raw'] > results[0]['delta_raw'] * 1.3)
+
+    return {'sweep': results, 'cfg_amplifies': cfg_amplifies}
+
+
+# -------------------------------------------------------------------
+#  Sub-test 3d: Content sensitivity (z=0, z_shuffled, z+delta)
+# -------------------------------------------------------------------
+@torch.inference_mode()
+def _test_3d_content_sensitivity(vla_model, image, instruction, unnorm_key,
+                                  cfg_scale, seed=42):
+    """
+    Compare z_real  vs  z_zero / z_shuffled / z+delta.
+    - z_zero large, z_shuffled small  → on/off only (BIAS_ONLY)
+    - z_zero large, z_shuffled large  → content matters (ALIVE)
+    - all small                       → dead
+    """
+    device = next(vla_model.parameters()).device
+    cog_dim = vla_model.action_model.net.z_embedder.linear.in_features
+
+    # z_real (baseline - no patching)
+    r_real = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed)
+
+    # z_zero
+    r_zero = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed,
+                          cog_patch_fn=lambda z: torch.zeros_like(z))
+
+    # z_shuffled (permute feature dims — same norm, different content)
+    perm = torch.randperm(cog_dim, generator=torch.Generator().manual_seed(9999))
+    def patch_shuffle(z, _p=perm):
+        return z[:, :, _p.to(z.device)].contiguous()
+    r_shuffle = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed,
+                             cog_patch_fn=patch_shuffle)
+
+    # z + delta (small perturbation, scale=0.1)
+    gen = torch.Generator(device=device).manual_seed(7777)
+    delta = torch.randn(1, 1, cog_dim, device=device, generator=gen) * 0.1
+    r_delta = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, seed,
+                           cog_patch_fn=lambda z, _d=delta: z + _d.to(z.device, dtype=z.dtype))
+
+    def _fmt(r):
+        return r['raw'][0].tolist() if r['raw'].ndim > 1 else r['raw'].tolist()
+
+    results = {}
+    for name, r in [('z_zero', r_zero), ('z_shuffled', r_shuffle), ('z_perturbed', r_delta)]:
+        results[name] = {
+            'delta_raw':  float(np.abs(r_real['raw']  - r['raw']).mean()),
+            'delta_final': float(np.abs(r_real['final'] - r['final']).mean()),
+            'first_raw': _fmt(r),
+        }
+    results['z_real'] = {'first_raw': _fmt(r_real)}
+
+    d_zero    = results['z_zero']['delta_raw']
+    d_shuffle = results['z_shuffled']['delta_raw']
+    d_perturb = results['z_perturbed']['delta_raw']
+
+    # Content sensitivity: shuffling destroys content → large delta means content used
+    content_sensitive = (d_shuffle > d_perturb * 3) and (d_zero > d_perturb * 3)
+
+    results['analysis'] = {
+        'content_sensitive': content_sensitive,
+        'd_zero': d_zero, 'd_shuffle': d_shuffle, 'd_perturb': d_perturb,
+    }
+    return results
+
+
+# -------------------------------------------------------------------
+#  Verdict computation
+# -------------------------------------------------------------------
+def _compute_verdict(floor, sweep, cfg, content):
+    """
+    Combine sub-test results into a nuanced verdict.
+
+    Returns (verdict_str, summary_str).
+    Possible verdicts: DEAD, BIAS_ONLY, WEAK, ALIVE
+    """
+    floor_raw = floor['delta_raw']
+    sig_threshold = max(floor_raw * 10, 1e-5)
+
+    d_zero    = content['analysis']['d_zero']
+    d_shuffle = content['analysis']['d_shuffle']
+    max_sweep = max(s['delta_raw'] for s in sweep['sweep'])
+
+    # (1) No response at any scale
+    if max_sweep < sig_threshold and d_zero < sig_threshold:
+        return "DEAD", "No measurable z response at any perturbation scale or condition."
+
+    # (2) z=0 differs from z_real → z has *some* contribution
+    #     but z_shuffled ≈ z_real → content doesn't matter, only on/off
+    if d_zero >= sig_threshold and d_shuffle < sig_threshold:
+        return "BIAS_ONLY", (
+            f"z acts as static bias (on/off). "
+            f"d_zero={d_zero:.6f} but d_shuffle={d_shuffle:.6f} (content ignored)."
+        )
+
+    # (3) Monotonic dose-response + content sensitive → alive
+    if sweep['is_monotonic'] and content['analysis']['content_sensitive']:
+        # Distinguish WEAK from ALIVE by absolute magnitude
+        mid = sweep['sweep'][1]['delta_raw']  # scale ≈ 0.1
+        if mid < 0.005:
+            return "WEAK", (
+                f"z pathway responsive & content-sensitive, but low gain. "
+                f"delta@0.1={mid:.6f}."
+            )
+        return "ALIVE", (
+            f"z pathway is responsive and content-sensitive. "
+            f"delta@0.1={mid:.6f}, monotonic dose-response confirmed."
+        )
+
+    # (4) Monotonic but content-insensitive → weak
+    if sweep['is_monotonic']:
+        return "WEAK", (
+            f"z pathway responds to perturbation scale (monotonic) "
+            f"but content sensitivity is unclear."
+        )
+
+    # (5) Fallback
+    return "WEAK", "z pathway shows partial response. Further investigation needed."
+
+
+# ===================================================================
+# Level 3 combined runner
 # ===================================================================
 @torch.inference_mode()
-def diagnose_z_sensitivity(
+def diagnose_z_sensitivity_v2(
     vla_model,
     image: Image.Image,
     instruction: str,
     unnorm_key: str = "libero_spatial_no_noops",
     cfg_scale: float = 1.5,
-    seeds: tuple = (42, 1337, 2024),
-    perturbation_scale: float = 0.1,
+    seed: int = 42,
+    perturbation_scales: tuple = (0.03, 0.1, 0.3, 1.0),
+    cfg_scales: tuple = (1.0, 1.5, 3.0),
+    include_cross_seed_ref: bool = True,
 ) -> dict:
     """
-    Level 3: Paired-seed output sensitivity for z (cog_tokens) pathway.
+    Level 3 Enhanced: Comprehensive z pathway sensitivity analysis.
 
-    For each seed, runs two conditions with IDENTICAL diffusion noise:
-      A. Baseline (unmodified cog_tokens)
-      B. cog_tokens + small perturbation (z pathway test)
-
-    By hooking into the model's internal state, we inject a perturbation
-    to cog_tokens AFTER memory bank processing but BEFORE DiT.
-
-    Uses DDIM 10 steps (eta=0) so noise is fully deterministic given seed.
+    Sub-tests:
+      3a. Deterministic floor (same-seed repeat)
+      3b. Perturbation scale sweep (dose-response curve)
+      3c. CFG scale sweep
+      3d. Content sensitivity (z=0, z_shuffled, z+delta)
     """
-    device = next(vla_model.parameters()).device
-    cog_dim = vla_model.action_model.net.z_embedder.linear.in_features  # 4096
+    results = {"level": 3}
 
-    # Fixed perturbation (seeded for reproducibility)
-    gen = torch.Generator(device=device).manual_seed(7777)
-    z_perturb = torch.randn(1, 1, cog_dim, device=device, generator=gen) * perturbation_scale
+    # ── 3a. Deterministic Floor ──
+    print("\n  3a. Deterministic Floor (same-seed repeat)")
+    print("  " + "-" * 44)
 
-    n_seeds = len(seeds)
-    total_calls = n_seeds * 2
-    call_count = [0]
+    floor = _test_3a_deterministic_floor(
+        vla_model, image, instruction, unnorm_key, cfg_scale, seed)
+    results['3a'] = floor
 
-    # We need to hook into predict_action to intercept cog_tokens.
-    # Strategy: monkey-patch cog_mem_bank.process_batch to add perturbation.
-    original_process_batch = vla_model.cog_mem_bank.process_batch
-    inject_perturbation = [False]  # mutable flag
+    is_det = floor['delta_raw'] < 1e-4
+    print(f"    raw   : delta_mean={floor['delta_raw']:.2e}  delta_max={floor['max_raw']:.2e}")
+    print(f"    final : delta_mean={floor['delta_final']:.2e}")
+    print(f"    -> {'Deterministic (floor ~ 0)' if is_det else 'Non-deterministic (floor > 0)'}")
 
-    def patched_process_batch(*args, **kwargs):
-        result = original_process_batch(*args, **kwargs)
-        if inject_perturbation[0]:
-            result = result + z_perturb.to(result.device, dtype=result.dtype)
-        return result
+    # ── 3b. Perturbation Scale Sweep ──
+    print(f"\n  3b. Perturbation Scale Sweep")
+    print("  " + "-" * 44)
 
-    def _run_one(seed, with_perturbation, label):
-        call_count[0] += 1
-        print(f"    [{call_count[0]}/{total_calls}] seed={seed} {label} ...", flush=True)
+    sweep = _test_3b_perturbation_sweep(
+        vla_model, image, instruction, unnorm_key, cfg_scale, seed,
+        scales=perturbation_scales)
+    results['3b'] = sweep
 
-        inject_perturbation[0] = with_perturbation
+    print(f"\n    {'scale':>6} | {'d_raw':>10} | {'d_final':>10} | {'raw/floor':>10}")
+    print(f"    {'-'*6}-+-{'-'*10}-+-{'-'*10}-+-{'-'*10}")
+    for s in sweep['sweep']:
+        rf = f"{s['delta_raw']/(floor['delta_raw']+1e-15):.0f}x" if floor['delta_raw'] > 1e-10 else "inf"
+        print(f"    {s['scale']:6.2f} | {s['delta_raw']:10.6f} | {s['delta_final']:10.6f} | {rf:>10}")
 
-        torch.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-        acts, _, conf = vla_model.predict_action(
-            image=image,
-            instruction=instruction,
-            unnorm_key=unnorm_key,
-            cfg_scale=cfg_scale,
-            use_ddim=True,
-            num_ddim_steps=10,
-            episode_first_frame="True",
-            return_confidence=True,
-            confidence_type="max_prob",
-        )
-        return acts
+    compr_ratios = [s['delta_final'] / (s['delta_raw'] + 1e-15) for s in sweep['sweep']
+                    if s['delta_raw'] > 1e-8]
+    compr = np.mean(compr_ratios) if compr_ratios else 1.0
+    print(f"\n    Monotonically increasing: {'YES' if sweep['is_monotonic'] else 'NO'}")
+    print(f"    Post-processing keeps {compr:.0%} of raw signal (rest lost to clip/binarize)")
 
-    # Monkey-patch
-    vla_model.cog_mem_bank.process_batch = patched_process_batch
+    # ── 3c. CFG Scale Sweep ──
+    print(f"\n  3c. CFG Scale Sweep (perturbation=0.1)")
+    print("  " + "-" * 44)
 
-    try:
-        paired_deltas = []
-        all_a_actions = []
-        per_seed_results = []
+    cfg_res = _test_3c_cfg_sweep(
+        vla_model, image, instruction, unnorm_key, seed,
+        perturbation_scale=0.1, cfg_scales=cfg_scales)
+    results['3c'] = cfg_res
 
-        for seed in seeds:
-            act_a = _run_one(seed, False, "A: Baseline z")
-            act_b = _run_one(seed, True, f"B: z + perturbation(scale={perturbation_scale})")
+    print(f"\n    {'cfg':>6} | {'d_raw':>10} | {'d_final':>10}")
+    print(f"    {'-'*6}-+-{'-'*10}-+-{'-'*10}")
+    for c in cfg_res['sweep']:
+        print(f"    {c['cfg']:6.1f} | {c['delta_raw']:10.6f} | {c['delta_final']:10.6f}")
 
-            d_ab = np.abs(act_a - act_b).mean()
-            paired_deltas.append(d_ab)
-            all_a_actions.append(act_a)
-            per_seed_results.append({
-                "seed": seed,
-                "act_a_first": act_a[0].tolist(),
-                "act_b_first": act_b[0].tolist(),
-                "delta": d_ab,
-            })
+    if len(cfg_res['sweep']) >= 2:
+        amp = cfg_res['sweep'][-1]['delta_raw'] / (cfg_res['sweep'][0]['delta_raw'] + 1e-15)
+        print(f"\n    CFG amplification (cfg={cfg_scales[-1]} vs {cfg_scales[0]}): {amp:.1f}x")
+        print(f"    Higher CFG amplifies z signal: {'YES' if cfg_res['cfg_amplifies'] else 'NO'}")
 
-        # Null baseline: A(seed_i) vs A(seed_j) → intrinsic noise variance
-        null_deltas = []
-        for i in range(n_seeds):
-            for j in range(i + 1, n_seeds):
-                null_deltas.append(np.abs(all_a_actions[i] - all_a_actions[j]).mean())
+    # ── 3d. Content Sensitivity ──
+    print(f"\n  3d. Content Sensitivity")
+    print("  " + "-" * 44)
 
-        mean_delta = np.mean(paired_deltas)
-        mean_null = np.mean(null_deltas) if null_deltas else 0.0
-        snr = mean_delta / (mean_null + 1e-10)
+    content = _test_3d_content_sensitivity(
+        vla_model, image, instruction, unnorm_key, cfg_scale, seed)
+    results['3d'] = content
 
-        z_responsive = mean_delta > mean_null * 2 and mean_delta > 0.001
+    print(f"\n    {'condition':>14} | {'d_raw':>10} | {'d_final':>10}")
+    print(f"    {'-'*14}-+-{'-'*10}-+-{'-'*10}")
+    for name in ['z_zero', 'z_shuffled', 'z_perturbed']:
+        c = content[name]
+        print(f"    {name:>14} | {c['delta_raw']:10.6f} | {c['delta_final']:10.6f}")
 
-        if z_responsive:
-            verdict = "Z_PATHWAY_ALIVE"
-            summary = (
-                f"z pathway IS responsive. "
-                f"Paired delta={mean_delta:.6f} vs noise floor={mean_null:.6f} "
-                f"(SNR={snr:.1f}x). "
-                f"L injected into cog_tokens WILL affect action output."
-            )
-        else:
-            verdict = "Z_PATHWAY_DEAD"
-            summary = (
-                f"z pathway NOT responsive. "
-                f"Paired delta={mean_delta:.6f} vs noise floor={mean_null:.6f} "
-                f"(SNR={snr:.1f}x). "
-                f"z perturbation has no effect — self-attention may not propagate z."
-            )
+    a = content['analysis']
+    print(f"\n    z=0 (on/off signal)    : {a['d_zero']:.6f}")
+    print(f"    z_shuffled (content)   : {a['d_shuffle']:.6f}")
+    print(f"    z+delta (perturbation) : {a['d_perturb']:.6f}")
+    print(f"    Content-sensitive: {'YES' if a['content_sensitive'] else 'NO'}")
 
-        return {
-            "per_seed": per_seed_results,
-            "mean_delta": mean_delta,
-            "null_baseline": mean_null,
-            "null_deltas": null_deltas,
-            "snr": snr,
-            "z_responsive": z_responsive,
-            "perturbation_scale": perturbation_scale,
-            "verdict": verdict,
-            "summary": summary,
-            "level": 3,
+    # ── Optional: Cross-seed reference (informational only) ──
+    if include_cross_seed_ref:
+        print(f"\n  Ref: Cross-seed variance (informational, NOT noise floor)")
+        print("  " + "-" * 44)
+        ref_seeds = (42, 1337, 2024)
+        ref_actions = []
+        for s in ref_seeds:
+            r = _run_one_v2(vla_model, image, instruction, unnorm_key, cfg_scale, s)
+            ref_actions.append(r)
+        cross_deltas = []
+        for i in range(len(ref_seeds)):
+            for j in range(i + 1, len(ref_seeds)):
+                d = float(np.abs(ref_actions[i]['raw'] - ref_actions[j]['raw']).mean())
+                cross_deltas.append(d)
+                print(f"    seed {ref_seeds[i]} vs {ref_seeds[j]}: {d:.6f}")
+        results['cross_seed_ref'] = {
+            'mean': float(np.mean(cross_deltas)),
+            'deltas': cross_deltas,
         }
+        print(f"    mean = {np.mean(cross_deltas):.6f}")
+        print(f"    (This is NOT used for verdict — shown for reference only)")
 
-    finally:
-        # Always restore
-        vla_model.cog_mem_bank.process_batch = original_process_batch
-        inject_perturbation[0] = False
+    # ── Verdict ──
+    verdict, summary = _compute_verdict(floor, sweep, cfg_res, content)
+    results['verdict'] = verdict
+    results['summary'] = summary
+
+    return results
 
 
 # ===================================================================
@@ -314,14 +581,14 @@ def run_cog_attn_diagnostics(
     instruction: str,
     unnorm_key: str = "libero_spatial_no_noops",
     cfg_scale: float = 1.5,
-    perturbation_scale: float = 0.1,
+    seed: int = 42,
+    perturbation_scales: tuple = (0.03, 0.1, 0.3, 1.0),
+    cfg_scales: tuple = (1.0, 1.5, 3.0),
 ) -> dict:
-    """
-    Run all 3 diagnostic levels for z (cog_tokens) pathway and print report.
-    """
+    """Run all 3 diagnostic levels for z (cog_tokens) pathway and print report."""
     results = {}
 
-    # ── Level 1: Self-attention weight magnitudes ──
+    # ── Level 1 ──
     print("=" * 60)
     print("  Level 1: Self-Attention Weight Magnitude (cog_attn)")
     print("=" * 60)
@@ -329,30 +596,23 @@ def run_cog_attn_diagnostics(
     results["level1"] = lv1
 
     for b in lv1["blocks"][:3]:
-        print(
-            f"  Block {b['block_idx']:2d}: "
-            f"qkv mean={b['qkv_mean_abs']:.6f} "
-            f"max={b['qkv_max_abs']:.6f}  "
-            f"proj mean={b['proj_mean_abs']:.6f}"
-        )
+        print(f"  Block {b['block_idx']:2d}: "
+              f"qkv mean={b['qkv_mean_abs']:.6f} max={b['qkv_max_abs']:.6f}  "
+              f"proj mean={b['proj_mean_abs']:.6f}")
     if len(lv1["blocks"]) > 3:
         print(f"  ... ({len(lv1['blocks'])} blocks total)")
-
     print(f"\n  z_embedder: mean={lv1['z_embedder']['mean_abs']:.6f} "
           f"max={lv1['z_embedder']['max_abs']:.6f}")
-
     if lv1["per_attn_mean_ref"] is not None:
         sa_avg = np.mean([b["qkv_mean_abs"] for b in lv1["blocks"]])
         print(f"\n  Comparison:")
         print(f"    self-attn qkv mean : {sa_avg:.6f}")
         print(f"    per_attn in_proj   : {lv1['per_attn_mean_ref']:.6f}")
         print(f"    ratio (SA/per)     : {sa_avg / (lv1['per_attn_mean_ref'] + 1e-10):.0f}x")
-
     print(f"\n  Verdict: {lv1['verdict']}")
-    print(f"  >> {lv1['summary']}")
-    print()
+    print(f"  >> {lv1['summary']}\n")
 
-    # ── Level 2: z contribution ratio ──
+    # ── Level 2 ──
     print("=" * 60)
     print("  Level 2: z Pathway Activation (cog vs zero)")
     print("=" * 60)
@@ -363,81 +623,74 @@ def run_cog_attn_diagnostics(
     print(f"  Delta (real z vs zero z) : mean={lv2['delta_mean']:.6f} max={lv2['delta_max']:.6f}")
     print(f"  Contribution ratio       : {lv2['ratio']:.4f}")
     print(f"  Verdict: {lv2['verdict']}")
-    print(f"  >> {lv2['summary']}")
-    print()
+    print(f"  >> {lv2['summary']}\n")
 
-    # ── Level 3: Paired-seed z sensitivity ──
+    # ── Level 3 Enhanced ──
     print("=" * 60)
-    print("  Level 3: Paired-Seed z Perturbation Test")
+    print("  Level 3 Enhanced: z Pathway Sensitivity Analysis")
     print("=" * 60)
-    print(f"  Same seed → same noise → delta = pure z pathway effect")
-    print(f"  Perturbation scale: {perturbation_scale}")
-    print(f"  DDIM 10 steps, eta=0 (deterministic)")
-    print()
-    lv3 = diagnose_z_sensitivity(
+    print(f"  DDIM 10 steps, eta=0 | seed={seed}")
+    print(f"  Perturbation scales: {perturbation_scales}")
+    print(f"  CFG scales: {cfg_scales}")
+
+    lv3 = diagnose_z_sensitivity_v2(
         vla_model, image, instruction,
-        unnorm_key=unnorm_key, cfg_scale=cfg_scale,
-        perturbation_scale=perturbation_scale,
+        unnorm_key=unnorm_key, cfg_scale=cfg_scale, seed=seed,
+        perturbation_scales=perturbation_scales, cfg_scales=cfg_scales,
     )
     results["level3"] = lv3
 
-    print()
-    print("  Per-seed paired deltas (z vs z+perturbation):")
-    for r in lv3["per_seed"]:
-        print(f"    seed={r['seed']:5d}: delta={r['delta']:.6f}")
-        print(f"      A: {[f'{v:.4f}' for v in r['act_a_first']]}")
-        print(f"      B: {[f'{v:.4f}' for v in r['act_b_first']]}")
-
-    print()
-    print(f"  Null baseline (A vs A, different seeds):")
-    for i, nd in enumerate(lv3["null_deltas"]):
-        print(f"    pair {i}: {nd:.6f}")
-    print(f"    mean noise floor = {lv3['null_baseline']:.6f}")
-
-    print()
-    print(f"  Mean paired delta (z signal) : {lv3['mean_delta']:.6f}")
-    print(f"  Noise floor (A vs A)         : {lv3['null_baseline']:.6f}")
-    print(f"  SNR (signal/noise)           : {lv3['snr']:.1f}x")
-    print()
-    print(f"  z pathway responsive? {lv3['z_responsive']}  (need SNR > 2x)")
-    print(f"  Verdict: {lv3['verdict']}")
-    print(f"  >> {lv3['summary']}")
-    print()
-
     # ── Final Summary ──
+    print()
     print("=" * 60)
     print("  FINAL SUMMARY: z (cog_tokens) Pathway")
     print("=" * 60)
-    print(f"  Level 1 (weights):     {lv1['verdict']}")
-    print(f"  Level 2 (activations): {lv2['verdict']}")
-    print(f"  Level 3 (sensitivity): {lv3['verdict']}")
+    print(f"  Level 1 (weights):        {lv1['verdict']}")
+    print(f"  Level 2 (activations):    {lv2['verdict']}")
+    print(f"  Level 3 (sensitivity):    {lv3['verdict']}")
+    print(f"    3a det. floor (raw):    {lv3['3a']['delta_raw']:.2e}")
+    print(f"    3b monotonic:           {lv3['3b']['is_monotonic']}")
+    print(f"    3c CFG amplifies:       {lv3['3c']['cfg_amplifies']}")
+    print(f"    3d content-sensitive:   {lv3['3d']['analysis']['content_sensitive']}")
     print()
 
-    if lv3["verdict"] == "Z_PATHWAY_ALIVE":
-        print("  ✓ z pathway is ALIVE and responsive.")
-        print("  → L injected into cog_tokens (z = z + αL) will affect actions.")
-        print(f"    Signal is {lv3['snr']:.1f}x above noise floor.")
-        print()
-        print("  Next steps:")
-        print("    1. Create L_z = zeros(1, 1, 4096) as learnable latent")
-        print("    2. Inject after cog_mem_bank: z = cog_tokens + α * L_z")
-        print("    3. Optimize L_z via SPSA or gradient-based methods")
+    v = lv3['verdict']
+    if v == "ALIVE":
+        print("  ALIVE: z pathway is responsive and content-sensitive.")
+        print("  -> SPSA on cog_tokens is viable.")
+        print(f"  >> {lv3['summary']}")
+    elif v == "WEAK":
+        print("  WEAK: z pathway responds but with low gain.")
+        print("  -> SPSA may work with larger alpha or more iterations.")
+        print(f"  >> {lv3['summary']}")
+    elif v == "BIAS_ONLY":
+        print("  BIAS_ONLY: z acts as static bias (on/off), content not utilized.")
+        print("  -> SPSA on z alone is insufficient; consider architectural changes")
+        print("     (e.g., AdaLN, broadcast z to all tokens, gating).")
+        print(f"  >> {lv3['summary']}")
+    elif v == "DEAD":
+        print("  DEAD: No measurable z response.")
+        print("  -> z pathway is non-functional. Investigate model loading/training.")
+        print(f"  >> {lv3['summary']}")
     else:
-        print("  ✗ z pathway is NOT responsive.")
-        print("  → Even cog_tokens perturbation doesn't change output.")
-        print("  → This would be very unexpected (self-attention should be alive)")
-        print("  → Check: is CFG scale too high? Is the model loaded correctly?")
+        print(f"  {v}: {lv3['summary']}")
     print()
 
-    results["recommendation"] = lv3["verdict"]
+    results["recommendation"] = v
     return results
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible alias for v1 callers
+# ---------------------------------------------------------------------------
+diagnose_z_sensitivity = diagnose_z_sensitivity_v2
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("cog_attn (z pathway) Diagnostics for MemoryVLA")
+    print("cog_attn (z pathway) Diagnostics v2 for MemoryVLA")
     print()
     print("Usage (Colab):")
     print("  from scripts.diagnose_cog_attn import run_cog_attn_diagnostics")

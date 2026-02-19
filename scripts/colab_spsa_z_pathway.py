@@ -242,6 +242,7 @@ def _eval_z_objective(
     instruction: str,
     L_z: torch.Tensor,
     cfg: ZSPSAConfig,
+    noise_seed: Optional[int] = None,
 ) -> Tuple[float, dict]:
     """
     Evaluate composite objective with L_z injected into z pathway.
@@ -253,11 +254,22 @@ def _eval_z_objective(
       gate = min(1.0, conf_llm / llm_gate_floor)  — soft penalty when
              the model doesn't understand the instruction at all.
 
+    Args:
+        noise_seed: If set, fixes the diffusion noise via torch.manual_seed()
+            before calling predict_action. This ensures paired L+/L- evals
+            in SPSA see the same stochastic conditions.
+
     Returns:
         J: scalar (higher = better)
         info: dict with conf_llm, conf_action, actions, raw_actions, etc.
     """
     _ensure_ddim(vla_model, cfg.num_ddim_steps)
+
+    # ── Fix diffusion noise for paired SPSA evaluation ──
+    if noise_seed is not None:
+        torch.manual_seed(noise_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(noise_seed)
 
     # ── Hook: inject L_z into cog_tokens ──
     original_process = vla_model.cog_mem_bank.process_batch
@@ -311,8 +323,12 @@ def _eval_z_objective(
             traj_var = 0.0
 
         # Smoothness (from action sequence inter-step jitter)
-        # Prefer raw_actions (pre-clip/binarize) to avoid post-processing distortion
-        smooth_source = raw_actions if raw_actions is not None else norm_actions
+        # Prefer raw_actions (pre-clip/binarize) to avoid binarization distortion,
+        # but clamp to [-1, 1] so smooth_tau is on the same scale as norm_actions.
+        if raw_actions is not None:
+            smooth_source = np.clip(raw_actions, -1.0, 1.0)
+        else:
+            smooth_source = norm_actions
         conf_smooth = _compute_smoothness(smooth_source, cfg.smooth_tau)
 
         # Combine sub-metrics
@@ -321,7 +337,7 @@ def _eval_z_objective(
         # -- Soft gate: penalize when conf_llm is too low --
         # Prevents "baseless confidence" where action metrics look OK
         # but the model doesn't actually understand the instruction.
-        gate = min(1.0, conf_llm / cfg.llm_gate_floor)
+        gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
 
         J = gate * (cfg.w_lang * conf_llm + cfg.w_act * conf_action)
 
@@ -400,8 +416,15 @@ def optimize_z_spsa(
         L_plus = L_z + ck * delta
         L_minus = L_z - ck * delta
 
-        J_p, info_p = _eval_z_objective(vla_model, image, instruction, L_plus, cfg)
-        J_m, info_m = _eval_z_objective(vla_model, image, instruction, L_minus, cfg)
+        # Same noise_seed for L+ and L-: ensures paired eval sees identical
+        # diffusion noise, so gradient estimate reflects only L_z difference.
+        # Critical for WEAK pathway where signal is small relative to noise.
+        noise_seed_k = (cfg.seed + k) if cfg.seed is not None else None
+
+        J_p, info_p = _eval_z_objective(vla_model, image, instruction, L_plus, cfg,
+                                         noise_seed=noise_seed_k)
+        J_m, info_m = _eval_z_objective(vla_model, image, instruction, L_minus, cfg,
+                                         noise_seed=noise_seed_k)
 
         # Scale normalization: prevent one metric from dominating
         if normalizer is not None:
@@ -425,8 +448,8 @@ def optimize_z_spsa(
             L_z = L_z * (cfg.max_L_norm / L_norm)
             L_norm = cfg.max_L_norm
 
-        # Action jerk monitoring
-        cur_actions = 0.5 * (info_p["actions"] + info_m["actions"])
+        # Action jerk monitoring (use norm_actions for task-independent scale)
+        cur_actions = 0.5 * (info_p["norm_actions"] + info_m["norm_actions"])
         jerk = float(np.abs(cur_actions - prev_actions).mean()) if prev_actions is not None else 0.0
         prev_actions = cur_actions
 
@@ -521,6 +544,9 @@ def calibrate_z_spsa(
         cal_cfg.a = cfg.a * a_mult
         cal_cfg.num_iters = cfg.cal_iters
         cal_cfg.verbose = False
+        # Disable normalization during calibration so J_init and J_end
+        # are on the same raw scale — prevents apples-to-oranges comparison
+        cal_cfg.normalize_objectives = False
 
         print(f"  [{idx+1}/{total}] cfg={cfg_s:.1f}  c={cal_cfg.c:.3f} (x{c_mult})  "
               f"a={cal_cfg.a:.3f} (x{a_mult}) ... ", end="", flush=True)
@@ -649,6 +675,13 @@ def run_phase_b(
     print(f"  num_iters={run_cfg.num_iters}  w_lang={run_cfg.w_lang}  w_act={run_cfg.w_act}")
     print()
 
+    # Explicit J_init at starting state (before any SPSA updates)
+    device = next(vla_model.parameters()).device
+    L_init = torch.zeros(1, 1, run_cfg.cog_dim, device=device, dtype=torch.float32)
+    J_init, info_init = _eval_z_objective(vla_model, image, instruction, L_init, run_cfg)
+    print(f"  J_init (L=0): {J_init:.4f}  "
+          f"(llm={info_init['conf_llm']:.4f}, act={info_init['conf_action']:.4f})")
+
     L_star, history = optimize_z_spsa(vla_model, image, instruction, run_cfg)
 
     # Final evaluation
@@ -657,14 +690,13 @@ def run_phase_b(
     )
 
     # Summary
-    J_start = history[0]["J"]
     J_end = history[-1]["J"]
 
     print()
     print("  " + "-" * 44)
-    print(f"  J: {J_start:.4f} -> {J_end:.4f} -> final={J_final:.4f}")
-    print(f"  conf_llm:    {history[0]['conf_llm']:.4f} -> {info_final['conf_llm']:.4f}")
-    print(f"  conf_action: {history[0]['conf_action']:.4f} -> {info_final['conf_action']:.4f}")
+    print(f"  J: {J_init:.4f} -> {J_end:.4f} -> final={J_final:.4f}")
+    print(f"  conf_llm:    {info_init['conf_llm']:.4f} -> {info_final['conf_llm']:.4f}")
+    print(f"  conf_action: {info_init['conf_action']:.4f} -> {info_final['conf_action']:.4f}")
     print(f"    traj:   {info_final['conf_traj']:.4f}  smooth: {info_final['conf_smooth']:.4f}")
     print(f"  gate:        {info_final['gate']:.3f}")
     print(f"  |L_z|: {history[-1]['L_norm']:.2f}")

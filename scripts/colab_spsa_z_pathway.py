@@ -296,6 +296,9 @@ def _eval_z_objective(
     # Otherwise L_z would be added twice: once by set_z_latent, once here.
     had_global_patch = hasattr(vla_model, "_z_latent_original_process")
     if had_global_patch:
+        if cfg.verbose:
+            print("  [warn] set_z_latent global patch detected — "
+                  "temporarily disabled for isolated L_z eval")
         global_patched = vla_model.cog_mem_bank.process_batch
         vla_model.cog_mem_bank.process_batch = vla_model._z_latent_original_process
 
@@ -436,10 +439,14 @@ def optimize_z_spsa(
         rng = torch.Generator(device=device).manual_seed(cfg.seed)
     else:
         rng = None
+        if cfg.verbose:
+            print("  [warn] cfg.seed is None — paired L+/L- evals will use "
+                  "different diffusion noise. Set seed for reproducible gradients.")
 
     history: List[dict] = []
     prev_actions = None
     normalizer = _RunningNormalizer(warmup=4) if cfg.normalize_objectives else None
+    _normalizer_freeze_logged = False
 
     for k in range(cfg.num_iters):
         ak = _gain_ak(k, cfg)
@@ -469,6 +476,12 @@ def optimize_z_spsa(
         if normalizer is not None:
             normalizer.update(info_p["conf_llm"], info_p["conf_action"])
             normalizer.update(info_m["conf_llm"], info_m["conf_action"])
+            if normalizer.ready and not _normalizer_freeze_logged:
+                if cfg.verbose:
+                    print(f"  [info] normalizer frozen at iter {k+1}: "
+                          f"llm μ={normalizer._frozen_llm_mean:.4f} σ={normalizer._frozen_llm_std:.4f}, "
+                          f"act μ={normalizer._frozen_act_mean:.4f} σ={normalizer._frozen_act_std:.4f}")
+                _normalizer_freeze_logged = True
             if normalizer.ready:
                 nlm_p, nac_p = normalizer.normalize(info_p["conf_llm"], info_p["conf_action"])
                 nlm_m, nac_m = normalizer.normalize(info_m["conf_llm"], info_m["conf_action"])

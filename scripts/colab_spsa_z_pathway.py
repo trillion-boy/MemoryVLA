@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
+import random
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -136,6 +137,14 @@ class ZSPSAConfig:
     # -- misc --
     seed: Optional[int] = 42
     verbose: bool = True
+
+    def __post_init__(self):
+        wsum = self.w_traj + self.w_smooth
+        if abs(wsum - 1.0) > 0.01:
+            raise ValueError(
+                f"w_traj ({self.w_traj}) + w_smooth ({self.w_smooth}) = {wsum}, "
+                f"expected ~1.0. conf_action scale will be distorted."
+            )
 
 
 # ===================================================================
@@ -265,11 +274,20 @@ def _eval_z_objective(
     """
     _ensure_ddim(vla_model, cfg.num_ddim_steps)
 
-    # ── Fix diffusion noise for paired SPSA evaluation ──
+    # ── Fix all RNG sources for paired SPSA evaluation ──
     if noise_seed is not None:
         torch.manual_seed(noise_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(noise_seed)
+        np.random.seed(noise_seed % (2**31))
+        random.seed(noise_seed)
+
+    # ── Guard: temporarily remove set_z_latent global patch if active ──
+    # Otherwise L_z would be added twice: once by set_z_latent, once here.
+    had_global_patch = hasattr(vla_model, "_z_latent_original_process")
+    if had_global_patch:
+        global_patched = vla_model.cog_mem_bank.process_batch
+        vla_model.cog_mem_bank.process_batch = vla_model._z_latent_original_process
 
     # ── Hook: inject L_z into cog_tokens ──
     original_process = vla_model.cog_mem_bank.process_batch
@@ -356,6 +374,9 @@ def _eval_z_objective(
 
     finally:
         vla_model.cog_mem_bank.process_batch = original_process
+        # Restore set_z_latent global patch if it was active before this call
+        if had_global_patch:
+            vla_model.cog_mem_bank.process_batch = global_patched
 
 
 # ===================================================================
@@ -488,7 +509,7 @@ def optimize_z_spsa(
                 f"act={raw_act:.4f} (traj={raw_traj:.3f} smooth={raw_smooth:.3f})  "
                 f"gate={avg_gate:.2f}  "
                 f"|L|={L_norm:.2f}  "
-                f"jerk={jerk:.4f}"
+                f"jerk(norm)={jerk:.4f}"
             )
 
     return L_z.detach(), history
@@ -700,6 +721,13 @@ def run_phase_b(
     print(f"    traj:   {info_final['conf_traj']:.4f}  smooth: {info_final['conf_smooth']:.4f}")
     print(f"  gate:        {info_final['gate']:.3f}")
     print(f"  |L_z|: {history[-1]['L_norm']:.2f}")
+
+    # Sanity check: J_end (in-loop, possibly normalized) vs J_final (post-eval, raw)
+    # Large divergence suggests normalizer distortion or stochastic instability.
+    j_divergence = abs(J_end - J_final)
+    if j_divergence > 0.1 * max(abs(J_end), abs(J_final), 1e-6):
+        print(f"  WARNING: J_end ({J_end:.4f}) and J_final ({J_final:.4f}) diverge by "
+              f"{j_divergence:.4f} — check normalizer or noise stability.")
     print()
 
     return {

@@ -274,8 +274,18 @@ def _eval_z_objective(
     """
     _ensure_ddim(vla_model, cfg.num_ddim_steps)
 
-    # ── Fix all RNG sources for paired SPSA evaluation ──
+    # ── Save and fix all RNG sources for paired SPSA evaluation ──
+    # Restore on exit so external notebook RNG is not corrupted.
+    _rng_states_saved = None
     if noise_seed is not None:
+        _rng_states_saved = {
+            "torch_cpu": torch.random.get_rng_state(),
+            "torch_cuda": [torch.cuda.get_rng_state(d)
+                           for d in range(torch.cuda.device_count())]
+                          if torch.cuda.is_available() else [],
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+        }
         torch.manual_seed(noise_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(noise_seed)
@@ -377,6 +387,13 @@ def _eval_z_objective(
         # Restore set_z_latent global patch if it was active before this call
         if had_global_patch:
             vla_model.cog_mem_bank.process_batch = global_patched
+        # Restore RNG states so external code is not affected
+        if _rng_states_saved is not None:
+            torch.random.set_rng_state(_rng_states_saved["torch_cpu"])
+            for d, state in enumerate(_rng_states_saved["torch_cuda"]):
+                torch.cuda.set_rng_state(state, d)
+            np.random.set_state(_rng_states_saved["numpy"])
+            random.setstate(_rng_states_saved["python"])
 
 
 # ===================================================================
@@ -389,7 +406,7 @@ def optimize_z_spsa(
     instruction: str,
     cfg: ZSPSAConfig,
     init_L: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, List[dict]]:
+) -> Tuple[torch.Tensor, List[dict], Optional[_RunningNormalizer]]:
     """
     Maximize composite objective w.r.t. L_z via SPSA on z pathway.
 
@@ -405,6 +422,7 @@ def optimize_z_spsa(
     Returns:
         L_star: Optimized latent [1, 1, cog_dim].
         history: List of per-iteration records.
+        normalizer: The frozen normalizer (or None if normalization disabled).
     """
     device = next(vla_model.parameters()).device
     dtype = next(vla_model.action_model.net.parameters()).dtype
@@ -512,7 +530,7 @@ def optimize_z_spsa(
                 f"jerk(norm)={jerk:.4f}"
             )
 
-    return L_z.detach(), history
+    return L_z.detach(), history, normalizer
 
 
 # ===================================================================
@@ -577,7 +595,7 @@ def calibrate_z_spsa(
             vla_model, image, instruction, L_zero, cal_cfg
         )
 
-        L_z, history = optimize_z_spsa(vla_model, image, instruction, cal_cfg)
+        L_z, history, _ = optimize_z_spsa(vla_model, image, instruction, cal_cfg)
 
         J_end = history[-1]["J"]
         improvement = J_end - J_init
@@ -624,8 +642,13 @@ def calibrate_z_spsa(
         print("\n  WARNING: No stable configurations found. Using least unstable.")
         stable_results = sorted(all_results, key=lambda r: r["L_norm"])[:3]
 
-    def _pareto_score(r: dict) -> float:
-        """Multi-criteria score: balance improvement, stability, and action quality."""
+    def _pareto_score(r: dict) -> Tuple[float, float]:
+        """Multi-criteria score: balance improvement, stability, and action quality.
+
+        Returns (score, improvement) — the second element is the tie-break:
+        when Pareto scores are near-identical (range collapse), prefer higher
+        raw improvement.
+        """
         # Normalize each axis to [0, 1] relative to the candidate set
         improvements = [s["improvement"] for s in stable_results]
         jerks = [s["max_jerk"] for s in stable_results]
@@ -641,7 +664,10 @@ def calibrate_z_spsa(
         norm_act = (r["end_conf_action"] - min(acts)) / max(act_range, 1e-8)
 
         # Weighted combination: improvement matters most
-        return 0.5 * norm_imp + 0.2 * norm_jerk + 0.3 * norm_act
+        score = 0.5 * norm_imp + 0.2 * norm_jerk + 0.3 * norm_act
+        # Tie-break: raw improvement (when score is near-identical due to
+        # range collapse, this ensures deterministic and sensible ordering)
+        return (score, r["improvement"])
 
     best = max(stable_results, key=_pareto_score)
 
@@ -703,31 +729,49 @@ def run_phase_b(
     print(f"  J_init (L=0): {J_init:.4f}  "
           f"(llm={info_init['conf_llm']:.4f}, act={info_init['conf_action']:.4f})")
 
-    L_star, history = optimize_z_spsa(vla_model, image, instruction, run_cfg)
+    L_star, history, opt_normalizer = optimize_z_spsa(
+        vla_model, image, instruction, run_cfg
+    )
 
-    # Final evaluation
+    # Final evaluation (raw scale — definitive measurement)
     J_final, info_final = _eval_z_objective(
         vla_model, image, instruction, L_star, run_cfg
     )
 
-    # Summary
-    J_end = history[-1]["J"]
+    # Summary: use raw J_init and J_final for definitive improvement
+    J_end_inloop = history[-1]["J"]
 
     print()
     print("  " + "-" * 44)
-    print(f"  J: {J_init:.4f} -> {J_end:.4f} -> final={J_final:.4f}")
+    print(f"  J (raw): {J_init:.4f} -> {J_final:.4f}  "
+          f"(improvement={J_final - J_init:+.4f})")
+    print(f"  J (in-loop last): {J_end_inloop:.4f}"
+          f"{'  [normalized]' if opt_normalizer is not None and opt_normalizer.ready else ''}")
     print(f"  conf_llm:    {info_init['conf_llm']:.4f} -> {info_final['conf_llm']:.4f}")
     print(f"  conf_action: {info_init['conf_action']:.4f} -> {info_final['conf_action']:.4f}")
     print(f"    traj:   {info_final['conf_traj']:.4f}  smooth: {info_final['conf_smooth']:.4f}")
     print(f"  gate:        {info_final['gate']:.3f}")
     print(f"  |L_z|: {history[-1]['L_norm']:.2f}")
 
-    # Sanity check: J_end (in-loop, possibly normalized) vs J_final (post-eval, raw)
-    # Large divergence suggests normalizer distortion or stochastic instability.
-    j_divergence = abs(J_end - J_final)
-    if j_divergence > 0.1 * max(abs(J_end), abs(J_final), 1e-6):
-        print(f"  WARNING: J_end ({J_end:.4f}) and J_final ({J_final:.4f}) diverge by "
-              f"{j_divergence:.4f} — check normalizer or noise stability.")
+    # Sanity check: compare J_end vs J_final on SAME scale.
+    # If normalizer was used, transform J_final to normalized space for comparison.
+    if opt_normalizer is not None and opt_normalizer.ready:
+        nlm_f, nac_f = opt_normalizer.normalize(
+            info_final["conf_llm"], info_final["conf_action"]
+        )
+        J_final_norm = info_final["gate"] * (
+            run_cfg.w_lang * nlm_f + run_cfg.w_act * nac_f
+        )
+        j_divergence = abs(J_end_inloop - J_final_norm)
+        if j_divergence > 0.1 * max(abs(J_end_inloop), abs(J_final_norm), 1e-6):
+            print(f"  WARNING: J_end_norm ({J_end_inloop:.4f}) vs J_final_norm "
+                  f"({J_final_norm:.4f}) diverge by {j_divergence:.4f} — "
+                  f"possible stochastic instability.")
+    else:
+        j_divergence = abs(J_end_inloop - J_final)
+        if j_divergence > 0.1 * max(abs(J_end_inloop), abs(J_final), 1e-6):
+            print(f"  WARNING: J_end ({J_end_inloop:.4f}) vs J_final ({J_final:.4f}) "
+                  f"diverge by {j_divergence:.4f}.")
     print()
 
     return {

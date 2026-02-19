@@ -28,7 +28,7 @@ Usage (Colab):
     from scripts.colab_spsa_z_pathway import (
         ZSPSAConfig, calibrate_z_spsa, optimize_z_spsa, run_z_spsa_full,
         plot_input_frame, plot_optimization_curves, plot_action_trajectory,
-        render_action_rollout,
+        render_action_rollout, closed_loop_rollout_multichunk,
     )
 
     # Quick: Phase A calibration + Phase B in one call
@@ -1146,7 +1146,16 @@ def render_action_rollout(
               f"— {'padding' if D_model < D_env else 'truncating'}")
 
     if reset:
-        env.reset()
+        try:
+            env.reset()
+        except AttributeError as exc:
+            if "_reset_mask" in str(exc):
+                raise RuntimeError(
+                    "ManiSkill env reset failed because scene is None. "
+                    "Recreate the environment object and retry rollout. "
+                    "Example: env = gym.make(...); render_action_rollout(env, actions)."
+                ) from exc
+            raise
 
     def _grab_frame():
         frame = env.render()
@@ -1192,6 +1201,188 @@ def render_action_rollout(
     display(HTML(anim.to_html5_video()))
 
     return frames
+
+
+def closed_loop_rollout_multichunk(
+    env,
+    vla_model,
+    instruction: str,
+    cfg: ZSPSAConfig,
+    n_chunks: int = 4,
+    steps_per_chunk: int = 16,
+    title: str = "Closed-loop Multi-chunk Rollout",
+    reset: bool = True,
+    env_factory=None,
+):
+    """Closed-loop rollout that replans actions every chunk.
+
+    This utility is intended for Colab experiments where a single 16-step chunk
+    may under-shoot final grasp depth.  It repeatedly:
+      1) captures current observation,
+      2) calls predict_action(...),
+      3) executes a short action chunk,
+      4) replans from the latest frame.
+
+    Args:
+        env: Gym/Gymnasium/ManiSkill environment.
+        vla_model: MemoryVLA model instance.
+        instruction: Text instruction.
+        cfg: ZSPSAConfig used for unnorm_key / cfg_scale / DDIM args.
+        n_chunks: Number of replan chunks.
+        steps_per_chunk: Number of executed steps per chunk.
+        title: Video title.
+        reset: Whether to reset env before rollout.
+        env_factory: Optional callable to rebuild env if reset fails due to
+            ManiSkill scene lifecycle issues.
+
+    Returns:
+        (frames, logs, env):
+            frames: list of rendered uint8 RGB frames,
+            logs: per-chunk metadata dicts,
+            env: possibly replaced env (if env_factory was used).
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
+    from IPython.display import HTML, display
+
+    def _safe_reset(_env):
+        if not reset:
+            return _env
+        try:
+            _env.reset()
+            return _env
+        except AttributeError as exc:
+            if "_reset_mask" not in str(exc):
+                raise
+            if env_factory is None:
+                raise RuntimeError(
+                    "ManiSkill env reset failed with scene=None (_reset_mask). "
+                    "Pass env_factory to recreate env automatically, or recreate "
+                    "env manually and retry."
+                ) from exc
+            print("  [closed-loop] reset failed; rebuilding env via env_factory()")
+            _env = env_factory()
+            _env.reset()
+            return _env
+
+    def _grab_frame(_env):
+        frame = _env.render()
+        if hasattr(frame, "cpu"):
+            frame = frame.cpu().numpy()
+        frame = np.squeeze(frame)
+        if frame.ndim == 3 and frame.max() <= 1.0:
+            frame = (frame * 255).astype(np.uint8)
+        return frame
+
+    def _to_pil(_frame):
+        return Image.fromarray(_frame)
+
+    def _adapt_action(_action_t, _env):
+        action_t = np.asarray(_action_t, dtype=np.float32).reshape(-1)
+        act_shape = _env.action_space.shape
+        d_env = act_shape[-1]
+        needs_batch = len(act_shape) == 2
+        d_model = action_t.shape[0]
+        if d_model < d_env:
+            action_t = np.concatenate(
+                [action_t, np.zeros(d_env - d_model, dtype=np.float32)]
+            )
+        elif d_model > d_env:
+            action_t = action_t[:d_env]
+        if needs_batch:
+            action_t = action_t.reshape(1, -1)
+        return action_t
+
+    def _predict_chunk(_pil_img, _first_frame: bool):
+        kwargs = dict(
+            image=_pil_img,
+            instruction=instruction,
+            unnorm_key=cfg.unnorm_key,
+            cfg_scale=cfg.cfg_scale,
+            use_ddim=cfg.use_ddim,
+            num_ddim_steps=cfg.num_ddim_steps,
+            episode_first_frame="True" if _first_frame else "False",
+        )
+        try:
+            out = vla_model.predict_action(
+                **kwargs,
+                return_confidence=True,
+                confidence_type=cfg.confidence_type,
+            )
+        except TypeError:
+            out = vla_model.predict_action(**kwargs)
+
+        if isinstance(out, tuple):
+            actions = out[0]
+            llm_conf = out[2] if len(out) >= 3 else None
+        else:
+            actions, llm_conf = out, None
+
+        actions = np.asarray(actions, dtype=np.float32)
+        if actions.ndim == 3:
+            actions = actions[0]
+        if actions.ndim == 1:
+            actions = actions.reshape(1, -1)
+        return actions, llm_conf
+
+    # ── Execute ──
+    env = _safe_reset(env)
+    frame = _grab_frame(env)
+    frames = [frame]
+    logs: List[dict] = []
+    done = False
+
+    for ck in range(n_chunks):
+        if done:
+            break
+
+        pil_img = _to_pil(frame)
+        actions, llm_conf = _predict_chunk(pil_img, _first_frame=(ck == 0))
+
+        exec_steps = min(steps_per_chunk, actions.shape[0])
+        logs.append({
+            "chunk": ck,
+            "pred_steps": int(actions.shape[0]),
+            "exec_steps": int(exec_steps),
+            "llm_conf": (
+                None if llm_conf is None
+                else float(np.asarray(llm_conf).mean())
+            ),
+        })
+
+        for t in range(exec_steps):
+            step_out = env.step(_adapt_action(actions[t], env))
+            if len(step_out) == 5:
+                _, _, terminated, truncated, _ = step_out
+                done = bool(terminated or truncated)
+            else:
+                _, _, done, _ = step_out
+            frame = _grab_frame(env)
+            frames.append(frame)
+            if done:
+                break
+
+    # ── Video ──
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_axis_off()
+    im = ax.imshow(frames[0])
+
+    def _update(i):
+        im.set_data(frames[i])
+        ax.set_title(f"{title} — frame {i}/{len(frames)-1}", fontsize=10)
+        return [im]
+
+    anim = animation.FuncAnimation(
+        fig, _update, frames=len(frames), interval=150, blit=True,
+    )
+    plt.close(fig)
+    display(HTML(anim.to_html5_video()))
+
+    print("=== Closed-loop chunk logs ===")
+    for row in logs:
+        print(row)
+
+    return frames, logs, env
 
 
 def plot_action_trajectory(
@@ -1247,7 +1438,7 @@ if __name__ == "__main__":
     print("  from scripts.colab_spsa_z_pathway import (")
     print("      ZSPSAConfig, run_z_spsa_full,")
     print("      plot_input_frame, plot_optimization_curves, plot_action_trajectory,")
-    print("      render_action_rollout,")
+    print("      render_action_rollout, closed_loop_rollout_multichunk,")
     print("  )")
     print('  cfg = ZSPSAConfig(unnorm_key="libero_spatial_no_noops")')
     print()
@@ -1268,3 +1459,10 @@ if __name__ == "__main__":
     print("  from scripts.colab_spsa_z_pathway import set_z_latent")
     print('  set_z_latent(vla, result["L_star"])')
     print("  actions, _ = vla.predict_action(image, instruction, ...)")
+    print()
+    print("Closed-loop rollout (multi-chunk re-planning):")
+    print('  set_z_latent(vla, result["L_star"])')
+    print("  frames, logs, env = closed_loop_rollout_multichunk(")
+    print("      env, vla, instruction, cfg,")
+    print("      n_chunks=4, steps_per_chunk=16,")
+    print("  )")

@@ -28,6 +28,7 @@ Usage (Colab):
     from scripts.colab_spsa_z_pathway import (
         ZSPSAConfig, calibrate_z_spsa, optimize_z_spsa, run_z_spsa_full,
         plot_input_frame, plot_optimization_curves, plot_action_trajectory,
+        render_action_rollout,
     )
 
     # Quick: Phase A calibration + Phase B in one call
@@ -191,6 +192,7 @@ class _RunningNormalizer:
         self._frozen_llm_std: float = 1.0
         self._frozen_act_mean: float = 0.0
         self._frozen_act_std: float = 1.0
+        self._llm_is_constant: bool = False
 
     @property
     def ready(self) -> bool:
@@ -204,7 +206,9 @@ class _RunningNormalizer:
         # Freeze once warmup is reached
         if len(self._llm_vals) >= self.warmup and not self._frozen:
             self._frozen_llm_mean = float(np.mean(self._llm_vals))
-            self._frozen_llm_std = max(float(np.std(self._llm_vals)), 1e-6)
+            raw_llm_std = float(np.std(self._llm_vals))
+            self._llm_is_constant = raw_llm_std < 1e-5
+            self._frozen_llm_std = max(raw_llm_std, 1e-6)
             self._frozen_act_mean = float(np.mean(self._act_vals))
             self._frozen_act_std = max(float(np.std(self._act_vals)), 1e-6)
             self._frozen = True
@@ -218,7 +222,13 @@ class _RunningNormalizer:
         def _sigmoid(x):
             return 1.0 / (1.0 + np.exp(-x))
 
-        nlm = _sigmoid((conf_llm - self._frozen_llm_mean) / self._frozen_llm_std)
+        # When llm σ ≈ 0 (constant), z-score would be extreme → use neutral 0.5.
+        # This is safe because w_lang=0 means nlm has no effect, and if user
+        # sets w_lang>0 with constant llm, the neutral value avoids instability.
+        if self._llm_is_constant:
+            nlm = 0.5
+        else:
+            nlm = _sigmoid((conf_llm - self._frozen_llm_mean) / self._frozen_llm_std)
         nac = _sigmoid((conf_action - self._frozen_act_mean) / self._frozen_act_std)
         return float(nlm), float(nac)
 
@@ -268,6 +278,7 @@ def _eval_z_objective(
     L_z: torch.Tensor,
     cfg: ZSPSAConfig,
     noise_seed: Optional[int] = None,
+    gate_disabled: bool = False,
 ) -> Tuple[float, dict]:
     """
     Evaluate composite objective with L_z injected into z pathway.
@@ -283,6 +294,8 @@ def _eval_z_objective(
         noise_seed: If set, fixes the diffusion noise via torch.manual_seed()
             before calling predict_action. This ensures paired L+/L- evals
             in SPSA see the same stochastic conditions.
+        gate_disabled: If True, gate is forced to 1.0 regardless of gate_mode.
+            Set by _resolve_gate_mode() when conf_llm is invariant to L_z.
 
     Returns:
         J: scalar (higher = better)
@@ -382,13 +395,11 @@ def _eval_z_objective(
         conf_action = cfg.w_traj * conf_traj + cfg.w_smooth * conf_smooth
 
         # -- Gate: penalize when conf_llm is too low --
-        # gate_mode controls behavior (see ZSPSAConfig.gate_mode).
-        # _gate_override is set by optimize_z_spsa when auto-detect disables gate.
-        if getattr(cfg, '_gate_disabled', False) or cfg.gate_mode == "disabled":
+        # gate_disabled is resolved once by _resolve_gate_mode() and passed
+        # explicitly — no dynamic attributes on cfg.
+        if gate_disabled or cfg.gate_mode == "disabled":
             gate = 1.0
-        elif cfg.gate_mode == "soft":
-            gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
-        else:  # "auto" — compute soft gate; optimizer will decide after warmup
+        else:  # "soft" or "auto" (pre-resolved to not-disabled)
             gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
 
         J = gate * (cfg.w_lang * conf_llm + cfg.w_act * conf_action)
@@ -421,6 +432,63 @@ def _eval_z_objective(
 
 
 # ===================================================================
+# Gate mode resolution
+# ===================================================================
+@torch.inference_mode()
+def _resolve_gate_mode(
+    vla_model,
+    image: Image.Image,
+    instruction: str,
+    cfg: ZSPSAConfig,
+) -> bool:
+    """Probe whether conf_llm responds to L_z changes.
+
+    Runs 2 evals (L=0 vs L=perturbation) with the same noise seed.
+    If conf_llm is identical → invariant to L_z → gate should be disabled.
+
+    This is called ONCE before optimization so that J_init, J_end, and
+    J_final all use the same gate state (fixes scale mismatch).
+
+    Returns:
+        True if gate should be disabled (conf_llm invariant to L_z).
+    """
+    if cfg.gate_mode == "disabled":
+        return True
+    if cfg.gate_mode == "soft":
+        return False
+
+    # "auto": probe with L=0 vs L=random perturbation
+    device = next(vla_model.parameters()).device
+    L_zero = torch.zeros(1, 1, cfg.cog_dim, device=device, dtype=torch.float32)
+    L_pert = torch.randn(1, 1, cfg.cog_dim, device=device) * cfg.c
+
+    probe_seed = (cfg.seed + 99999) if cfg.seed is not None else None
+    _, info_0 = _eval_z_objective(
+        vla_model, image, instruction, L_zero, cfg,
+        noise_seed=probe_seed, gate_disabled=True,
+    )
+    _, info_p = _eval_z_objective(
+        vla_model, image, instruction, L_pert, cfg,
+        noise_seed=probe_seed, gate_disabled=True,
+    )
+
+    llm_diff = abs(info_0["conf_llm"] - info_p["conf_llm"])
+    disabled = llm_diff < 1e-5
+
+    if cfg.verbose:
+        if disabled:
+            print(f"  [auto-gate] conf_llm: {info_0['conf_llm']:.6f} (L=0) vs "
+                  f"{info_p['conf_llm']:.6f} (L=pert) — diff={llm_diff:.2e} ≈ 0")
+            print(f"  [auto-gate] conf_llm is invariant to L_z → gate DISABLED")
+        else:
+            print(f"  [auto-gate] conf_llm: {info_0['conf_llm']:.6f} (L=0) vs "
+                  f"{info_p['conf_llm']:.6f} (L=pert) — diff={llm_diff:.4f}")
+            print(f"  [auto-gate] conf_llm responds to L_z → soft gate ACTIVE")
+
+    return disabled
+
+
+# ===================================================================
 # Core SPSA loop for z pathway
 # ===================================================================
 @torch.inference_mode()
@@ -430,6 +498,7 @@ def optimize_z_spsa(
     instruction: str,
     cfg: ZSPSAConfig,
     init_L: Optional[torch.Tensor] = None,
+    gate_disabled: bool = False,
 ) -> Tuple[torch.Tensor, List[dict], Optional[_RunningNormalizer]]:
     """
     Maximize composite objective w.r.t. L_z via SPSA on z pathway.
@@ -442,6 +511,7 @@ def optimize_z_spsa(
         instruction: Language instruction.
         cfg: SPSA configuration.
         init_L: Optional warm-start latent [1, 1, cog_dim].
+        gate_disabled: Pre-resolved gate state from _resolve_gate_mode().
 
     Returns:
         L_star: Optimized latent [1, 1, cog_dim].
@@ -468,7 +538,6 @@ def optimize_z_spsa(
     prev_actions = None
     normalizer = _RunningNormalizer(warmup=4) if cfg.normalize_objectives else None
     _normalizer_freeze_logged = False
-    _gate_auto_resolved = False
 
     for k in range(cfg.num_iters):
         ak = _gain_ak(k, cfg)
@@ -490,30 +559,11 @@ def optimize_z_spsa(
         noise_seed_k = (cfg.seed + k) if cfg.seed is not None else None
 
         J_p, info_p = _eval_z_objective(vla_model, image, instruction, L_plus, cfg,
-                                         noise_seed=noise_seed_k)
+                                         noise_seed=noise_seed_k,
+                                         gate_disabled=gate_disabled)
         J_m, info_m = _eval_z_objective(vla_model, image, instruction, L_minus, cfg,
-                                         noise_seed=noise_seed_k)
-
-        # Auto gate detection: after 4 evals, check if conf_llm has zero variance
-        if cfg.gate_mode == "auto" and not _gate_auto_resolved and k >= 1:
-            llm_samples = [info_p["conf_llm"], info_m["conf_llm"]]
-            # Collect from history too
-            for h in history:
-                llm_samples.append(h["conf_llm"])
-            if len(llm_samples) >= 4:
-                llm_std = float(np.std(llm_samples))
-                if llm_std < 1e-5:
-                    cfg._gate_disabled = True
-                    if cfg.verbose:
-                        print(f"  [auto-gate] conf_llm σ={llm_std:.2e} ≈ 0 across "
-                              f"{len(llm_samples)} samples → gate DISABLED")
-                        print(f"  [auto-gate] reason: L_z injects after LLM generate, "
-                              f"so conf_llm is invariant to L_z")
-                else:
-                    if cfg.verbose:
-                        print(f"  [auto-gate] conf_llm σ={llm_std:.4f} > 0 → "
-                              f"keeping soft gate (conf_llm responds to L_z)")
-                _gate_auto_resolved = True
+                                         noise_seed=noise_seed_k,
+                                         gate_disabled=gate_disabled)
 
         # Scale normalization: prevent one metric from dominating
         if normalizer is not None:
@@ -598,11 +648,15 @@ def calibrate_z_spsa(
     image: Image.Image,
     instruction: str,
     cfg: ZSPSAConfig,
+    gate_disabled: bool = False,
 ) -> dict:
     """
     Phase A: Short SPSA sweeps over (cfg_scale, c, a) to find best config.
 
     Runs cal_iters per combination, measures J improvement and stability.
+
+    Args:
+        gate_disabled: Pre-resolved gate state from _resolve_gate_mode().
 
     Returns:
         dict with:
@@ -617,7 +671,8 @@ def calibrate_z_spsa(
     # Baseline: no L_z
     device = next(vla_model.parameters()).device
     L_zero = torch.zeros(1, 1, cfg.cog_dim, device=device, dtype=torch.float32)
-    J_base, info_base = _eval_z_objective(vla_model, image, instruction, L_zero, cfg)
+    J_base, info_base = _eval_z_objective(
+        vla_model, image, instruction, L_zero, cfg, gate_disabled=gate_disabled)
     print(f"  Baseline (L_z=0): J={J_base:.4f} "
           f"(llm={info_base['conf_llm']:.4f}, act={info_base['conf_action']:.4f})")
     print()
@@ -648,10 +703,14 @@ def calibrate_z_spsa(
 
         # Explicit J_init at L=0 with this config's cfg_scale
         J_init, _ = _eval_z_objective(
-            vla_model, image, instruction, L_zero, cal_cfg
+            vla_model, image, instruction, L_zero, cal_cfg,
+            gate_disabled=gate_disabled,
         )
 
-        L_z, history, _ = optimize_z_spsa(vla_model, image, instruction, cal_cfg)
+        L_z, history, _ = optimize_z_spsa(
+            vla_model, image, instruction, cal_cfg,
+            gate_disabled=gate_disabled,
+        )
 
         J_end = history[-1]["J"]
         improvement = J_end - J_init
@@ -753,12 +812,14 @@ def run_phase_b(
     instruction: str,
     cfg: ZSPSAConfig,
     cal_result: dict,
+    gate_disabled: bool = False,
 ) -> dict:
     """
     Phase B: Full SPSA optimization using best params from Phase A.
 
     Args:
         cal_result: Output from calibrate_z_spsa().
+        gate_disabled: Pre-resolved gate state from _resolve_gate_mode().
 
     Returns:
         dict with L_star, history, final actions, etc.
@@ -779,22 +840,25 @@ def run_phase_b(
     print()
 
     # Explicit J_init at starting state (before any SPSA updates)
+    # gate_disabled is pre-resolved — same state for J_init, optimize, and J_final
     device = next(vla_model.parameters()).device
     L_init = torch.zeros(1, 1, run_cfg.cog_dim, device=device, dtype=torch.float32)
-    # Reset _gate_disabled for this phase (auto-detect will re-trigger)
-    if hasattr(run_cfg, '_gate_disabled'):
-        del run_cfg._gate_disabled
-    J_init, info_init = _eval_z_objective(vla_model, image, instruction, L_init, run_cfg)
+    J_init, info_init = _eval_z_objective(
+        vla_model, image, instruction, L_init, run_cfg,
+        gate_disabled=gate_disabled,
+    )
     print(f"  J_init (L=0): {J_init:.4f}  "
           f"(llm={info_init['conf_llm']:.4f}, act={info_init['conf_action']:.4f})")
 
     L_star, history, opt_normalizer = optimize_z_spsa(
-        vla_model, image, instruction, run_cfg
+        vla_model, image, instruction, run_cfg,
+        gate_disabled=gate_disabled,
     )
 
     # Final evaluation (raw scale — definitive measurement)
     J_final, info_final = _eval_z_objective(
-        vla_model, image, instruction, L_star, run_cfg
+        vla_model, image, instruction, L_star, run_cfg,
+        gate_disabled=gate_disabled,
     )
 
     # Summary: use raw J_init and J_final for definitive improvement
@@ -864,11 +928,17 @@ def run_z_spsa_full(
         print(result["final_actions"])
         print(result["best_params"])
     """
+    # Resolve gate mode once — ensures consistent gate state across
+    # all J evaluations (J_init, in-loop, J_final) in both phases.
+    gate_off = _resolve_gate_mode(vla_model, image, instruction, cfg)
+
     # Phase A
-    cal = calibrate_z_spsa(vla_model, image, instruction, cfg)
+    cal = calibrate_z_spsa(vla_model, image, instruction, cfg,
+                           gate_disabled=gate_off)
 
     # Phase B
-    phase_b = run_phase_b(vla_model, image, instruction, cfg, cal)
+    phase_b = run_phase_b(vla_model, image, instruction, cfg, cal,
+                          gate_disabled=gate_off)
 
     # Final summary
     print("=" * 60)
@@ -1024,6 +1094,85 @@ def plot_optimization_curves(history: List[dict], title: str = "SPSA Optimizatio
     plt.show()
 
 
+def render_action_rollout(
+    env,
+    actions: np.ndarray,
+    title: str = "Action Rollout",
+    reset: bool = True,
+    max_steps: Optional[int] = None,
+):
+    """Execute predicted actions in a gym env and display as inline video.
+
+    Works with ManiSkill3 (gymnasium) environments.
+
+    Args:
+        env: Gymnasium env with render_mode="rgb_array".
+        actions: [T, D] or [1, T, D] array of actions to execute.
+            Should be un-normalized (env-scale) actions from result["final_actions"].
+        title: Title for the video.
+        reset: If True, reset env before rollout.
+        max_steps: Limit number of steps (default: all actions).
+
+    Returns:
+        List of RGB frames (numpy arrays) for further use.
+
+    Usage (Colab):
+        frames = render_action_rollout(env, result["final_actions"])
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib import animation
+    from IPython.display import HTML, display
+
+    a = np.asarray(actions)
+    if a.ndim == 3:
+        a = a[0]  # [1, T, D] → [T, D]
+    T = a.shape[0]
+    if max_steps is not None:
+        T = min(T, max_steps)
+
+    if reset:
+        env.reset()
+
+    frames = []
+    # Capture initial frame
+    frame = env.render()
+    if hasattr(frame, 'cpu'):
+        frame = frame.cpu().numpy()
+    frame = np.squeeze(frame)
+    if frame.max() <= 1.0:
+        frame = (frame * 255).astype(np.uint8)
+    frames.append(frame)
+
+    for t in range(T):
+        action_t = a[t]
+        env.step(action_t)
+        frame = env.render()
+        if hasattr(frame, 'cpu'):
+            frame = frame.cpu().numpy()
+        frame = np.squeeze(frame)
+        if frame.max() <= 1.0:
+            frame = (frame * 255).astype(np.uint8)
+        frames.append(frame)
+
+    # Create animation
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.set_axis_off()
+    im = ax.imshow(frames[0])
+
+    def _update(i):
+        im.set_data(frames[i])
+        ax.set_title(f"{title} — step {i}/{len(frames)-1}", fontsize=10)
+        return [im]
+
+    anim = animation.FuncAnimation(
+        fig, _update, frames=len(frames), interval=200, blit=True,
+    )
+    plt.close(fig)
+    display(HTML(anim.to_html5_video()))
+
+    return frames
+
+
 def plot_action_trajectory(
     norm_actions: np.ndarray,
     baseline_actions: Optional[np.ndarray] = None,
@@ -1077,6 +1226,7 @@ if __name__ == "__main__":
     print("  from scripts.colab_spsa_z_pathway import (")
     print("      ZSPSAConfig, run_z_spsa_full,")
     print("      plot_input_frame, plot_optimization_curves, plot_action_trajectory,")
+    print("      render_action_rollout,")
     print("  )")
     print('  cfg = ZSPSAConfig(unnorm_key="libero_spatial_no_noops")')
     print()

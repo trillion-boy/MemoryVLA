@@ -152,40 +152,49 @@ class _RunningNormalizer:
       conf_action might live in [0.1, 0.5]  (wide, low)
     Without normalization, J = 0.5*llm + 0.5*act is dominated by llm.
 
-    After warmup (default 4 samples), both signals are z-scored then
-    mapped to [0, 1] via sigmoid, so w_lang and w_act control true
-    relative importance.
+    Collects statistics during warmup, then FREEZES them so the SPSA
+    objective landscape stays stationary. This prevents the normalizer
+    itself from shifting the gradient signal that SPSA is trying to follow.
     """
 
     def __init__(self, warmup: int = 4):
         self.warmup = warmup
         self._llm_vals: List[float] = []
         self._act_vals: List[float] = []
+        self._frozen = False
+        self._frozen_llm_mean: float = 0.0
+        self._frozen_llm_std: float = 1.0
+        self._frozen_act_mean: float = 0.0
+        self._frozen_act_std: float = 1.0
 
     @property
     def ready(self) -> bool:
-        return len(self._llm_vals) >= self.warmup
+        return self._frozen or len(self._llm_vals) >= self.warmup
 
     def update(self, conf_llm: float, conf_action: float):
+        if self._frozen:
+            return
         self._llm_vals.append(conf_llm)
         self._act_vals.append(conf_action)
+        # Freeze once warmup is reached
+        if len(self._llm_vals) >= self.warmup and not self._frozen:
+            self._frozen_llm_mean = float(np.mean(self._llm_vals))
+            self._frozen_llm_std = max(float(np.std(self._llm_vals)), 1e-6)
+            self._frozen_act_mean = float(np.mean(self._act_vals))
+            self._frozen_act_std = max(float(np.std(self._act_vals)), 1e-6)
+            self._frozen = True
 
     def normalize(self, conf_llm: float, conf_action: float) -> Tuple[float, float]:
         """Return normalized scores in ~[0, 1] with comparable spread."""
         if not self.ready:
             return conf_llm, conf_action
 
-        llm_mean = np.mean(self._llm_vals)
-        llm_std = max(np.std(self._llm_vals), 1e-6)
-        act_mean = np.mean(self._act_vals)
-        act_std = max(np.std(self._act_vals), 1e-6)
-
-        # z-score → sigmoid → [0, 1]
+        # z-score → sigmoid → [0, 1]  (using frozen statistics)
         def _sigmoid(x):
             return 1.0 / (1.0 + np.exp(-x))
 
-        nlm = _sigmoid((conf_llm - llm_mean) / llm_std)
-        nac = _sigmoid((conf_action - act_mean) / act_std)
+        nlm = _sigmoid((conf_llm - self._frozen_llm_mean) / self._frozen_llm_std)
+        nac = _sigmoid((conf_action - self._frozen_act_mean) / self._frozen_act_std)
         return float(nlm), float(nac)
 
 
@@ -301,8 +310,10 @@ def _eval_z_objective(
             conf_traj = conf_llm
             traj_var = 0.0
 
-        # Smoothness (from predicted action sequence inter-step jitter)
-        conf_smooth = _compute_smoothness(norm_actions, cfg.smooth_tau)
+        # Smoothness (from action sequence inter-step jitter)
+        # Prefer raw_actions (pre-clip/binarize) to avoid post-processing distortion
+        smooth_source = raw_actions if raw_actions is not None else norm_actions
+        conf_smooth = _compute_smoothness(smooth_source, cfg.smooth_tau)
 
         # Combine sub-metrics
         conf_action = cfg.w_traj * conf_traj + cfg.w_smooth * conf_smooth
@@ -399,8 +410,9 @@ def optimize_z_spsa(
             if normalizer.ready:
                 nlm_p, nac_p = normalizer.normalize(info_p["conf_llm"], info_p["conf_action"])
                 nlm_m, nac_m = normalizer.normalize(info_m["conf_llm"], info_m["conf_action"])
-                J_p = cfg.w_lang * nlm_p + cfg.w_act * nac_p
-                J_m = cfg.w_lang * nlm_m + cfg.w_act * nac_m
+                # Re-apply gate so "baseless confidence" penalty survives normalization
+                J_p = info_p["gate"] * (cfg.w_lang * nlm_p + cfg.w_act * nac_p)
+                J_m = info_m["gate"] * (cfg.w_lang * nlm_m + cfg.w_act * nac_m)
 
         # SPSA gradient estimate (ascent → maximize J)
         ghat = ((J_p - J_m) / (2.0 * ck)) * delta
@@ -513,11 +525,15 @@ def calibrate_z_spsa(
         print(f"  [{idx+1}/{total}] cfg={cfg_s:.1f}  c={cal_cfg.c:.3f} (x{c_mult})  "
               f"a={cal_cfg.a:.3f} (x{a_mult}) ... ", end="", flush=True)
 
+        # Explicit J_init at L=0 with this config's cfg_scale
+        J_init, _ = _eval_z_objective(
+            vla_model, image, instruction, L_zero, cal_cfg
+        )
+
         L_z, history = optimize_z_spsa(vla_model, image, instruction, cal_cfg)
 
-        J_start = history[0]["J"]
         J_end = history[-1]["J"]
-        improvement = J_end - J_start
+        improvement = J_end - J_init
         L_norm = history[-1]["L_norm"]
         max_jerk = max(h["jerk"] for h in history[1:]) if len(history) > 1 else 0.0
         stable = L_norm < cfg.max_L_norm * 0.9
@@ -537,7 +553,7 @@ def calibrate_z_spsa(
             "a": cal_cfg.a,
             "c_mult": c_mult,
             "a_mult": a_mult,
-            "J_start": J_start,
+            "J_init": J_init,
             "J_end": J_end,
             "improvement": improvement,
             "L_norm": L_norm,
@@ -551,7 +567,7 @@ def calibrate_z_spsa(
 
         status = "OK" if stable else "UNSTABLE"
         trend = "UP" if trend_up else "flat/down"
-        print(f"J: {J_start:.4f} -> {J_end:.4f} ({improvement:+.4f})  "
+        print(f"J: {J_init:.4f} -> {J_end:.4f} ({improvement:+.4f})  "
               f"|L|={L_norm:.1f}  jerk={max_jerk:.4f}  [{status}, {trend}]")
 
     # Select best: Pareto-style multi-criteria scoring
@@ -586,7 +602,7 @@ def calibrate_z_spsa(
     print(f"  Best: cfg={best['cfg_scale']:.1f}  "
           f"c={best['c']:.3f} (x{best['c_mult']})  "
           f"a={best['a']:.3f} (x{best['a_mult']})")
-    print(f"    J: {best['J_start']:.4f} -> {best['J_end']:.4f} "
+    print(f"    J: {best['J_init']:.4f} -> {best['J_end']:.4f} "
           f"(improvement={best['improvement']:+.4f})")
     print()
 

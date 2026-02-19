@@ -9,9 +9,11 @@ Why z pathway instead of per_token pathway:
 
 Key improvements over the old SPSA:
   1. Targets z pathway (cog_tokens) instead of dead per_token pathway
-  2. Composite objective: J = w_lang * conf_llm + w_act * conf_action
-     - conf_llm: LLM token probability (language-level)
+  2. Composite objective: J = gate * (w_lang * conf_llm + w_act * conf_action)
+     - conf_llm: LLM token probability (INVARIANT to L_z — see gate_mode)
      - conf_action: trajectory consistency (action-level, zero extra cost)
+     NOTE: L_z injects after LLM generate, so conf_llm cannot respond to L_z.
+     Default: w_lang=0, w_act=1, gate_mode='auto' (auto-detects and disables gate).
   3. Phase A calibration → Phase B full optimization
   4. Stability monitoring (L_z norm, action jerk)
 
@@ -25,6 +27,7 @@ Diagnostic basis (from diagnose_cog_attn.py v2):
 Usage (Colab):
     from scripts.colab_spsa_z_pathway import (
         ZSPSAConfig, calibrate_z_spsa, optimize_z_spsa, run_z_spsa_full,
+        plot_input_frame, plot_optimization_curves, plot_action_trajectory,
     )
 
     # Quick: Phase A calibration + Phase B in one call
@@ -94,10 +97,13 @@ class ZSPSAConfig:
     num_ddim_steps: int = 10
 
     # -- composite objective --
-    w_lang: float = 0.5
+    w_lang: float = 0.0
     """Weight for LLM confidence in composite J.
-    If prioritizing action execution, increase w_act (e.g., 0.4/0.6)."""
-    w_act: float = 0.5
+    Default 0.0 because L_z injects AFTER LLM token generation:
+      LLM generate → conf_llm computed → cog_tokens extracted → L_z added
+    So conf_llm is structurally invariant to L_z (zero gradient signal).
+    Only increase if architecture changes to inject L_z before LLM."""
+    w_act: float = 1.0
     """Weight for action confidence in composite J."""
     w_traj: float = 0.7
     """Sub-weight for trajectory certainty within conf_action."""
@@ -105,9 +111,14 @@ class ZSPSAConfig:
     """Sub-weight for intra-trajectory smoothness within conf_action.
     Smoothness = how smooth the predicted future actions are (no jitter)."""
     llm_gate_floor: float = 0.3
-    """Soft gate: if conf_llm < this, J is penalized proportionally.
-    Prevents 'baseless confidence' where action looks good but the model
-    doesn't actually understand the instruction/scene."""
+    """Soft gate floor (only used when gate_mode='soft').
+    If conf_llm < this, J is penalized proportionally."""
+    gate_mode: str = "auto"
+    """How to apply the conf_llm gate:
+      'auto': Check conf_llm variance during warmup. If σ ≈ 0 (invariant
+              to L_z), disable gate and warn. Otherwise use soft gate.
+      'soft': Always apply gate = min(1, conf_llm / llm_gate_floor).
+      'disabled': Gate is always 1.0 (no penalty from conf_llm)."""
     normalize_objectives: bool = True
     """If True, normalize conf_llm and conf_action to comparable scales
     using running statistics from the first few iterations. This prevents
@@ -144,6 +155,11 @@ class ZSPSAConfig:
             raise ValueError(
                 f"w_traj ({self.w_traj}) + w_smooth ({self.w_smooth}) = {wsum}, "
                 f"expected ~1.0. conf_action scale will be distorted."
+            )
+        if self.gate_mode not in ("auto", "soft", "disabled"):
+            raise ValueError(
+                f"gate_mode must be 'auto', 'soft', or 'disabled', "
+                f"got '{self.gate_mode}'"
             )
 
 
@@ -365,10 +381,15 @@ def _eval_z_objective(
         # Combine sub-metrics
         conf_action = cfg.w_traj * conf_traj + cfg.w_smooth * conf_smooth
 
-        # -- Soft gate: penalize when conf_llm is too low --
-        # Prevents "baseless confidence" where action metrics look OK
-        # but the model doesn't actually understand the instruction.
-        gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
+        # -- Gate: penalize when conf_llm is too low --
+        # gate_mode controls behavior (see ZSPSAConfig.gate_mode).
+        # _gate_override is set by optimize_z_spsa when auto-detect disables gate.
+        if getattr(cfg, '_gate_disabled', False) or cfg.gate_mode == "disabled":
+            gate = 1.0
+        elif cfg.gate_mode == "soft":
+            gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
+        else:  # "auto" — compute soft gate; optimizer will decide after warmup
+            gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
 
         J = gate * (cfg.w_lang * conf_llm + cfg.w_act * conf_action)
 
@@ -447,6 +468,7 @@ def optimize_z_spsa(
     prev_actions = None
     normalizer = _RunningNormalizer(warmup=4) if cfg.normalize_objectives else None
     _normalizer_freeze_logged = False
+    _gate_auto_resolved = False
 
     for k in range(cfg.num_iters):
         ak = _gain_ak(k, cfg)
@@ -471,6 +493,27 @@ def optimize_z_spsa(
                                          noise_seed=noise_seed_k)
         J_m, info_m = _eval_z_objective(vla_model, image, instruction, L_minus, cfg,
                                          noise_seed=noise_seed_k)
+
+        # Auto gate detection: after 4 evals, check if conf_llm has zero variance
+        if cfg.gate_mode == "auto" and not _gate_auto_resolved and k >= 1:
+            llm_samples = [info_p["conf_llm"], info_m["conf_llm"]]
+            # Collect from history too
+            for h in history:
+                llm_samples.append(h["conf_llm"])
+            if len(llm_samples) >= 4:
+                llm_std = float(np.std(llm_samples))
+                if llm_std < 1e-5:
+                    cfg._gate_disabled = True
+                    if cfg.verbose:
+                        print(f"  [auto-gate] conf_llm σ={llm_std:.2e} ≈ 0 across "
+                              f"{len(llm_samples)} samples → gate DISABLED")
+                        print(f"  [auto-gate] reason: L_z injects after LLM generate, "
+                              f"so conf_llm is invariant to L_z")
+                else:
+                    if cfg.verbose:
+                        print(f"  [auto-gate] conf_llm σ={llm_std:.4f} > 0 → "
+                              f"keeping soft gate (conf_llm responds to L_z)")
+                _gate_auto_resolved = True
 
         # Scale normalization: prevent one metric from dominating
         if normalizer is not None:
@@ -738,6 +781,9 @@ def run_phase_b(
     # Explicit J_init at starting state (before any SPSA updates)
     device = next(vla_model.parameters()).device
     L_init = torch.zeros(1, 1, run_cfg.cog_dim, device=device, dtype=torch.float32)
+    # Reset _gate_disabled for this phase (auto-detect will re-trigger)
+    if hasattr(run_cfg, '_gate_disabled'):
+        del run_cfg._gate_disabled
     J_init, info_init = _eval_z_objective(vla_model, image, instruction, L_init, run_cfg)
     print(f"  J_init (L=0): {J_init:.4f}  "
           f"(llm={info_init['conf_llm']:.4f}, act={info_init['conf_action']:.4f})")
@@ -794,6 +840,7 @@ def run_phase_b(
         "final_info": info_final,
         "final_actions": info_final["actions"],
         "final_norm_actions": info_final["norm_actions"],
+        "baseline_norm_actions": info_init["norm_actions"],
         "run_cfg": run_cfg,
     }
 
@@ -840,6 +887,8 @@ def run_z_spsa_full(
         "phase_b": phase_b,
         "L_star": phase_b["L_star"],
         "final_actions": phase_b["final_actions"],
+        "final_norm_actions": phase_b["final_norm_actions"],
+        "baseline_norm_actions": phase_b["baseline_norm_actions"],
         "final_J": phase_b["final_J"],
         "baseline_J": cal["baseline_J"],
         "best_params": {
@@ -883,15 +932,166 @@ def set_z_latent(vla_model, L_z: torch.Tensor):
 
 
 # ===================================================================
+# Visualization (Colab)
+# ===================================================================
+def plot_input_frame(image: Image.Image, instruction: str = ""):
+    """Display the input observation image in Colab/Jupyter.
+
+    Args:
+        image: PIL observation image (robot + scene).
+        instruction: Optional instruction text shown as title.
+    """
+    import matplotlib.pyplot as plt
+
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.imshow(image)
+    ax.set_axis_off()
+    if instruction:
+        ax.set_title(instruction, fontsize=10, wrap=True)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_optimization_curves(history: List[dict], title: str = "SPSA Optimization"):
+    """Plot optimization metrics over iterations.
+
+    Shows 4 subplots:
+      1. Objective J over iterations
+      2. conf_action breakdown (traj + smooth)
+      3. Action jerk (stability)
+      4. |L_z| norm (latent magnitude)
+
+    Args:
+        history: List of per-iteration records from optimize_z_spsa().
+        title: Plot title.
+    """
+    import matplotlib.pyplot as plt
+
+    if not history:
+        print("  [viz] No history to plot.")
+        return
+
+    iters = [h["iter"] for h in history]
+    J_vals = [h["J"] for h in history]
+    act_vals = [h["conf_action"] for h in history]
+    traj_vals = [h["conf_traj"] for h in history]
+    smooth_vals = [h["conf_smooth"] for h in history]
+    gate_vals = [h["gate"] for h in history]
+    jerk_vals = [h["jerk"] for h in history]
+    L_norms = [h["L_norm"] for h in history]
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle(title, fontsize=13)
+
+    # 1. Objective J
+    ax = axes[0, 0]
+    ax.plot(iters, J_vals, "b-", linewidth=1.5, label="J (composite)")
+    ax.set_ylabel("J")
+    ax.set_xlabel("Iteration")
+    ax.set_title("Objective")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # 2. conf_action breakdown
+    ax = axes[0, 1]
+    ax.plot(iters, act_vals, "g-", linewidth=1.5, label="conf_action")
+    ax.plot(iters, traj_vals, "g--", linewidth=1, alpha=0.7, label="traj")
+    ax.plot(iters, smooth_vals, "g:", linewidth=1, alpha=0.7, label="smooth")
+    ax.plot(iters, gate_vals, "r-", linewidth=1, alpha=0.5, label="gate")
+    ax.set_ylabel("Confidence")
+    ax.set_xlabel("Iteration")
+    ax.set_title("Action Confidence & Gate")
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+
+    # 3. Action jerk
+    ax = axes[1, 0]
+    ax.plot(iters, jerk_vals, "orange", linewidth=1.5)
+    ax.set_ylabel("Jerk (norm-space)")
+    ax.set_xlabel("Iteration")
+    ax.set_title("Action Stability")
+    ax.grid(True, alpha=0.3)
+
+    # 4. |L_z| norm
+    ax = axes[1, 1]
+    ax.plot(iters, L_norms, "purple", linewidth=1.5)
+    ax.set_ylabel("|L_z|")
+    ax.set_xlabel("Iteration")
+    ax.set_title("Latent Magnitude")
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_action_trajectory(
+    norm_actions: np.ndarray,
+    baseline_actions: Optional[np.ndarray] = None,
+    title: str = "Predicted Actions",
+):
+    """Visualize predicted action sequence as line plots per dimension.
+
+    Args:
+        norm_actions: [T, D] or [1, T, D] normalized actions from the model.
+        baseline_actions: Optional [T, D] baseline (L_z=0) for comparison.
+        title: Plot title.
+    """
+    import matplotlib.pyplot as plt
+
+    a = np.asarray(norm_actions)
+    if a.ndim == 3:
+        a = a[0]
+    T, D = a.shape
+    dim_labels = ["x", "y", "z", "rx", "ry", "rz", "grip"][:D]
+
+    fig, axes = plt.subplots(1, min(D, 7), figsize=(min(D, 7) * 2.2, 3))
+    if D == 1:
+        axes = [axes]
+    fig.suptitle(title, fontsize=11)
+
+    for d in range(min(D, 7)):
+        ax = axes[d]
+        ax.plot(range(T), a[:, d], "b-", linewidth=1.5, label="optimized")
+        if baseline_actions is not None:
+            b = np.asarray(baseline_actions)
+            if b.ndim == 3:
+                b = b[0]
+            ax.plot(range(T), b[:, d], "r--", linewidth=1, alpha=0.6, label="baseline")
+        ax.set_title(dim_labels[d], fontsize=9)
+        ax.set_ylim(-1.1, 1.1)
+        ax.grid(True, alpha=0.3)
+        if d == 0:
+            ax.legend(fontsize=7)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ===================================================================
 # CLI
 # ===================================================================
 if __name__ == "__main__":
     print("Z-Pathway SPSA Optimization for MemoryVLA")
     print()
     print("Usage (Colab):")
-    print("  from scripts.colab_spsa_z_pathway import ZSPSAConfig, run_z_spsa_full")
+    print("  from scripts.colab_spsa_z_pathway import (")
+    print("      ZSPSAConfig, run_z_spsa_full,")
+    print("      plot_input_frame, plot_optimization_curves, plot_action_trajectory,")
+    print("  )")
     print('  cfg = ZSPSAConfig(unnorm_key="libero_spatial_no_noops")')
+    print()
+    print("  # Show input scene")
+    print("  plot_input_frame(image, instruction)")
+    print()
+    print("  # Run optimization")
     print("  result = run_z_spsa_full(vla, image, instruction, cfg)")
+    print()
+    print("  # Visualize results")
+    print('  plot_optimization_curves(result["phase_b"]["history"])')
+    print("  plot_action_trajectory(")
+    print('      result["final_norm_actions"],')
+    print('      baseline_actions=result["baseline_norm_actions"],')
+    print("  )")
     print()
     print("After optimization, inject L_z for all future calls:")
     print("  from scripts.colab_spsa_z_pathway import set_z_latent")

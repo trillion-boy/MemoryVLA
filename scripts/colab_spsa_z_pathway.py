@@ -1104,6 +1104,9 @@ def render_action_rollout(
     """Execute predicted actions in a gym env and display as inline video.
 
     Works with ManiSkill3 (gymnasium) environments.
+    Handles shape mismatches automatically:
+      - Adds batch dimension (1, D) for ManiSkill3 vectorized envs
+      - Pads/truncates action dim to match env.action_space
 
     Args:
         env: Gymnasium env with render_mode="rgb_array".
@@ -1117,42 +1120,60 @@ def render_action_rollout(
         List of RGB frames (numpy arrays) for further use.
 
     Usage (Colab):
-        frames = render_action_rollout(env, result["final_actions"])
+        env2 = gym.make("PickCube-v1", obs_mode="rgbd", render_mode="rgb_array")
+        frames = render_action_rollout(env2, result["final_actions"])
     """
     import matplotlib.pyplot as plt
     from matplotlib import animation
     from IPython.display import HTML, display
 
-    a = np.asarray(actions)
+    a = np.asarray(actions, dtype=np.float32)
     if a.ndim == 3:
         a = a[0]  # [1, T, D] → [T, D]
-    T = a.shape[0]
+    if a.ndim == 1:
+        a = a.reshape(1, -1)  # [D] → [1, D]
+    T, D_model = a.shape
     if max_steps is not None:
         T = min(T, max_steps)
+
+    # Detect expected action shape from env
+    act_shape = env.action_space.shape  # e.g. (8,) or (1, 8)
+    D_env = act_shape[-1]
+    needs_batch = len(act_shape) == 2  # ManiSkill3: (num_envs, action_dim)
+
+    if D_model != D_env:
+        print(f"  [rollout] action dim mismatch: model={D_model}, env={D_env} "
+              f"— {'padding' if D_model < D_env else 'truncating'}")
 
     if reset:
         env.reset()
 
-    frames = []
-    # Capture initial frame
-    frame = env.render()
-    if hasattr(frame, 'cpu'):
-        frame = frame.cpu().numpy()
-    frame = np.squeeze(frame)
-    if frame.max() <= 1.0:
-        frame = (frame * 255).astype(np.uint8)
-    frames.append(frame)
-
-    for t in range(T):
-        action_t = a[t]
-        env.step(action_t)
+    def _grab_frame():
         frame = env.render()
         if hasattr(frame, 'cpu'):
             frame = frame.cpu().numpy()
         frame = np.squeeze(frame)
-        if frame.max() <= 1.0:
+        if frame.ndim == 3 and frame.max() <= 1.0:
             frame = (frame * 255).astype(np.uint8)
-        frames.append(frame)
+        return frame
+
+    frames = [_grab_frame()]
+
+    for t in range(T):
+        action_t = a[t]  # (D_model,)
+
+        # Pad or truncate to match env action dim
+        if D_model < D_env:
+            action_t = np.concatenate([action_t, np.zeros(D_env - D_model, dtype=np.float32)])
+        elif D_model > D_env:
+            action_t = action_t[:D_env]
+
+        # Add batch dim for ManiSkill3 vectorized envs
+        if needs_batch:
+            action_t = action_t.reshape(1, -1)
+
+        env.step(action_t)
+        frames.append(_grab_frame())
 
     # Create animation
     fig, ax = plt.subplots(figsize=(6, 6))

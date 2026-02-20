@@ -42,6 +42,15 @@ Usage (Colab):
     print(cal["best"])
     # Update cfg with best params, then run Phase B
     result = optimize_z_spsa(vla, image, instruction, cfg)
+
+    # Closed-loop with base_camera (front view, LIBERO-aligned):
+    #   Create env with 224x224 sensor resolution to match model input:
+    #     env = gym.make("PickCube-v1", obs_mode="rgbd", render_mode="rgb_array",
+    #                    sensor_configs=dict(base_camera=dict(width=224, height=224)))
+    #   frames, logs, env = closed_loop_rollout_multichunk(
+    #       env, vla, instruction, cfg,
+    #       use_base_camera=True,   # front-view obs camera (default)
+    #   )
 """
 from __future__ import annotations
 
@@ -1213,6 +1222,8 @@ def closed_loop_rollout_multichunk(
     title: str = "Closed-loop Multi-chunk Rollout",
     reset: bool = True,
     env_factory=None,
+    use_base_camera: bool = True,
+    camera_name: str = "base_camera",
 ):
     """Closed-loop rollout that replans actions every chunk.
 
@@ -1234,10 +1245,16 @@ def closed_loop_rollout_multichunk(
         reset: Whether to reset env before rollout.
         env_factory: Optional callable to rebuild env if reset fails due to
             ManiSkill scene lifecycle issues.
+        use_base_camera: If True, use obs-based sensor camera (front view,
+            closer to LIBERO agentview distribution) for model input instead
+            of env.render() (diagonal render_camera). Default True.
+        camera_name: Sensor camera name to extract from obs. Default
+            "base_camera" (ManiSkill3 PickCube front-facing camera at
+            [0.3, 0, 0.6]).
 
     Returns:
         (frames, logs, env):
-            frames: list of rendered uint8 RGB frames,
+            frames: list of rendered uint8 RGB frames (render_camera for video),
             logs: per-chunk metadata dicts,
             env: possibly replaced env (if env_factory was used).
     """
@@ -1246,11 +1263,14 @@ def closed_loop_rollout_multichunk(
     from IPython.display import HTML, display
 
     def _safe_reset(_env):
+        """Reset env and return (env, obs). obs may be None if reset=False."""
         if not reset:
-            return _env
+            return _env, None
         try:
-            _env.reset()
-            return _env
+            obs = _env.reset()
+            if isinstance(obs, tuple):
+                obs = obs[0]  # gymnasium returns (obs, info)
+            return _env, obs
         except AttributeError as exc:
             if "_reset_mask" not in str(exc):
                 raise
@@ -1262,10 +1282,13 @@ def closed_loop_rollout_multichunk(
                 ) from exc
             print("  [closed-loop] reset failed; rebuilding env via env_factory()")
             _env = env_factory()
-            _env.reset()
-            return _env
+            obs = _env.reset()
+            if isinstance(obs, tuple):
+                obs = obs[0]
+            return _env, obs
 
-    def _grab_frame(_env):
+    def _grab_render_frame(_env):
+        """Grab frame from render_camera (for video visualization only)."""
         frame = _env.render()
         if hasattr(frame, "cpu"):
             frame = frame.cpu().numpy()
@@ -1273,6 +1296,37 @@ def closed_loop_rollout_multichunk(
         if frame.ndim == 3 and frame.max() <= 1.0:
             frame = (frame * 255).astype(np.uint8)
         return frame
+
+    def _obs_to_model_frame(obs):
+        """Extract base_camera RGB from obs dict as uint8 numpy array.
+
+        ManiSkill3 obs structure: obs["sensor_data"][camera_name]["rgb"]
+        Returns (H, W, 3) uint8 array suitable for PIL conversion.
+        """
+        rgb = None
+        # ManiSkill3: obs["sensor_data"]["base_camera"]["rgb"]
+        if isinstance(obs, dict) and "sensor_data" in obs:
+            cam_data = obs["sensor_data"].get(camera_name, {})
+            if isinstance(cam_data, dict) and "rgb" in cam_data:
+                rgb = cam_data["rgb"]
+        # Fallback: obs["image"]["base_camera"]["rgb"]
+        if rgb is None and isinstance(obs, dict) and "image" in obs:
+            cam_data = obs["image"].get(camera_name, {})
+            if isinstance(cam_data, dict) and "rgb" in cam_data:
+                rgb = cam_data["rgb"]
+        if rgb is None:
+            print(f"  [WARN] base_camera not found in obs, falling back to env.render()")
+            return None
+
+        if hasattr(rgb, "cpu"):
+            rgb = rgb.cpu().numpy()
+        rgb = np.squeeze(rgb)
+        # Keep only RGB channels (drop alpha if present)
+        if rgb.ndim == 3 and rgb.shape[-1] == 4:
+            rgb = rgb[:, :, :3]
+        if rgb.ndim == 3 and rgb.max() <= 1.0:
+            rgb = (rgb * 255).astype(np.uint8)
+        return rgb.astype(np.uint8)
 
     def _to_pil(_frame):
         return Image.fromarray(_frame)
@@ -1326,17 +1380,35 @@ def closed_loop_rollout_multichunk(
         return actions, llm_conf
 
     # ── Execute ──
-    env = _safe_reset(env)
-    frame = _grab_frame(env)
-    frames = [frame]
+    env, obs = _safe_reset(env)
+
+    # Model-input frame: base_camera (front view) if available, else render
+    model_frame = None
+    if use_base_camera and obs is not None:
+        model_frame = _obs_to_model_frame(obs)
+    if model_frame is None:
+        model_frame = _grab_render_frame(env)
+        if use_base_camera:
+            print("  [closed-loop] base_camera unavailable at reset; "
+                  "using env.render() for chunk 0")
+
+    # Video frames always come from render_camera (for human viewing)
+    render_frame = _grab_render_frame(env)
+    frames = [render_frame]
     logs: List[dict] = []
     done = False
+
+    if use_base_camera:
+        print(f"  [closed-loop] model input: obs[sensor_data][{camera_name}][rgb] "
+              f"(front view, shape={model_frame.shape})")
+    else:
+        print("  [closed-loop] model input: env.render() (render_camera, diagonal)")
 
     for ck in range(n_chunks):
         if done:
             break
 
-        pil_img = _to_pil(frame)
+        pil_img = _to_pil(model_frame)
         actions, llm_conf = _predict_chunk(pil_img, _first_frame=(ck == 0))
 
         exec_steps = min(steps_per_chunk, actions.shape[0])
@@ -1348,17 +1420,28 @@ def closed_loop_rollout_multichunk(
                 None if llm_conf is None
                 else float(np.asarray(llm_conf).mean())
             ),
+            "model_input": camera_name if use_base_camera else "render_camera",
         })
 
         for t in range(exec_steps):
             step_out = env.step(_adapt_action(actions[t], env))
+            # Extract obs from step output
             if len(step_out) == 5:
-                _, _, terminated, truncated, _ = step_out
+                obs_t, _, terminated, truncated, _ = step_out
                 done = bool(terminated or truncated)
             else:
-                _, _, done, _ = step_out
-            frame = _grab_frame(env)
-            frames.append(frame)
+                obs_t, _, done_flag, _ = step_out
+                done = bool(done_flag)
+
+            # Update model-input frame from base_camera obs
+            if use_base_camera and obs_t is not None:
+                new_model_frame = _obs_to_model_frame(obs_t)
+                if new_model_frame is not None:
+                    model_frame = new_model_frame
+
+            # Video frame from render_camera
+            render_frame = _grab_render_frame(env)
+            frames.append(render_frame)
             if done:
                 break
 

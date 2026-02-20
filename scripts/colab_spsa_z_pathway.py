@@ -1011,6 +1011,53 @@ def set_z_latent(vla_model, L_z: torch.Tensor):
 
 
 # ===================================================================
+# Checkpoint: save / load L* result
+# ===================================================================
+def save_z_result(result: dict, path: str) -> None:
+    """Save run_z_spsa_full() result to a .pt file.
+
+    Saves L_star tensor, metrics, best_params, and optimization history.
+    Usage:
+        result = run_z_spsa_full(vla, image, instruction, cfg)
+        save_z_result(result, "L_star_libero_base.pt")
+    """
+    import os
+    payload = {
+        "L_star": result["L_star"].detach().cpu(),
+        "final_J": result["final_J"],
+        "baseline_J": result["baseline_J"],
+        "best_params": result["best_params"],
+        "final_actions": result["final_actions"],
+        "final_norm_actions": result["final_norm_actions"],
+        "baseline_norm_actions": result["baseline_norm_actions"],
+        "history": result["phase_b"]["history"],
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(payload, path)
+    norm = float(payload["L_star"].norm())
+    print(f"  Saved L* checkpoint -> {path}")
+    print(f"    |L*|={norm:.2f}  J={result['final_J']:.4f}  "
+          f"(baseline={result['baseline_J']:.4f})")
+
+
+def load_z_result(path: str, device: str = "cuda") -> dict:
+    """Load a saved L* checkpoint.
+
+    Returns a dict with L_star (on device), metrics, and history.
+    Usage:
+        ckpt = load_z_result("L_star_libero_base.pt")
+        set_z_latent(vla, ckpt["L_star"])
+    """
+    ckpt = torch.load(path, map_location="cpu")
+    ckpt["L_star"] = ckpt["L_star"].to(device)
+    norm = float(ckpt["L_star"].norm())
+    print(f"  Loaded L* checkpoint <- {path}")
+    print(f"    |L*|={norm:.2f}  J={ckpt['final_J']:.4f}  "
+          f"(baseline={ckpt['baseline_J']:.4f})")
+    return ckpt
+
+
+# ===================================================================
 # Visualization (Colab)
 # ===================================================================
 def plot_input_frame(image: Image.Image, instruction: str = ""):

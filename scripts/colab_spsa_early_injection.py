@@ -194,7 +194,7 @@ def _eval_early_objective(
     """
     Evaluate composite objective with L_z injected BEFORE LLM (early injection).
 
-    J = gate * (w_lang * conf_llm + w_act * conf_action)
+    J = (gate * w_lang * conf_llm) + (w_act * conf_action)
 
     Key difference from _eval_z_objective (late):
       - L_z is added to projected_patch_embeddings via projector forward hook.
@@ -308,7 +308,8 @@ def _eval_early_objective(
         else:
             gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
 
-        J = gate * (cfg.w_lang * conf_llm + cfg.w_act * conf_action)
+        # Gate dampens only the lang term; action term is never gated.
+        J = (gate * cfg.w_lang * conf_llm) + (cfg.w_act * conf_action)
 
         return J, {
             "conf_llm": conf_llm,

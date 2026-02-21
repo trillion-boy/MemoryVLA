@@ -9,7 +9,7 @@ Why z pathway instead of per_token pathway:
 
 Key improvements over the old SPSA:
   1. Targets z pathway (cog_tokens) instead of dead per_token pathway
-  2. Composite objective: J = gate * (w_lang * conf_llm + w_act * conf_action)
+  2. Composite objective: J = (gate * w_lang * conf_llm) + (w_act * conf_action)
      - conf_llm: LLM token probability (INVARIANT to L_z — see gate_mode)
      - conf_action: trajectory consistency (action-level, zero extra cost)
      NOTE: L_z injects after LLM generate, so conf_llm cannot respond to L_z.
@@ -292,7 +292,7 @@ def _eval_z_objective(
     """
     Evaluate composite objective with L_z injected into z pathway.
 
-    J = gate * (w_lang * conf_llm + w_act * conf_action)
+    J = (gate * w_lang * conf_llm) + (w_act * conf_action)
 
     where:
       conf_action = w_traj * trajectory_certainty + w_smooth * smoothness
@@ -411,7 +411,8 @@ def _eval_z_objective(
         else:  # "soft" or "auto" (pre-resolved to not-disabled)
             gate = min(1.0, conf_llm / max(cfg.llm_gate_floor, 1e-6))
 
-        J = gate * (cfg.w_lang * conf_llm + cfg.w_act * conf_action)
+        # Gate dampens only the lang term; action term is never gated.
+        J = (gate * cfg.w_lang * conf_llm) + (cfg.w_act * conf_action)
 
         return J, {
             "conf_llm": conf_llm,

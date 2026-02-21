@@ -381,7 +381,15 @@ def _resolve_gate_mode_early(
 
     llm_diff = abs(info_0["conf_llm"] - info_p["conf_llm"])
     act_diff = abs(info_0["conf_action"] - info_p["conf_action"])
-    disabled = llm_diff < 1e-5
+
+    # Use RELATIVE threshold: delta must be >1% of base value to count as
+    # responsive.  Absolute 1e-5 is too tight — early injection routes L_z
+    # through the full LLM, so floating-point noise alone can produce
+    # delta ~ 1e-4 without any meaningful gradient signal.
+    llm_base = max(abs(info_0["conf_llm"]), 1e-8)
+    llm_rel = llm_diff / llm_base
+    REL_THRESHOLD = 0.01  # 1% relative change required
+    disabled = llm_rel < REL_THRESHOLD
 
     if cfg.verbose:
         print()
@@ -389,16 +397,19 @@ def _resolve_gate_mode_early(
         print("  EARLY INJECTION — conf_llm responsiveness probe")
         print("  " + "=" * 50)
         print(f"  conf_llm:    {info_0['conf_llm']:.6f} (L=0) vs "
-              f"{info_p['conf_llm']:.6f} (L=pert) — delta={llm_diff:.2e}")
+              f"{info_p['conf_llm']:.6f} (L=pert)")
+        print(f"    abs delta={llm_diff:.2e}  "
+              f"rel delta={llm_rel:.4f} ({llm_rel*100:.2f}%)  "
+              f"threshold={REL_THRESHOLD:.0%}")
         print(f"  conf_action: {info_0['conf_action']:.6f} (L=0) vs "
               f"{info_p['conf_action']:.6f} (L=pert) — delta={act_diff:.2e}")
         if disabled:
-            print("  RESULT: conf_llm is INVARIANT to early L_z")
-            print("          (same as late injection — no LLM-level benefit)")
-            print("          gate DISABLED, w_lang should stay 0.0")
+            print(f"  RESULT: conf_llm delta {llm_rel*100:.2f}% < {REL_THRESHOLD*100:.0f}% threshold")
+            print("          Treating as INVARIANT (numerical noise, not real signal)")
+            print("          gate DISABLED, w_lang stays 0.0")
         else:
-            print("  RESULT: conf_llm RESPONDS to early L_z!")
-            print("          (early injection advantage CONFIRMED)")
+            print(f"  RESULT: conf_llm delta {llm_rel*100:.2f}% >= {REL_THRESHOLD*100:.0f}% threshold")
+            print("          conf_llm RESPONDS to early L_z!")
             print(f"          gate: soft mode ACTIVE (floor={cfg.llm_gate_floor})")
             print("          Phase 2: consider increasing w_lang > 0")
         print("  " + "=" * 50)

@@ -925,6 +925,57 @@ def clear_early_z_latent(vla_model):
 
 
 # ===================================================================
+# Checkpoint: save / load early L* result
+# ===================================================================
+def save_early_result(result: dict, path: str) -> None:
+    """Save run_early_spsa_full() result to a .pt checkpoint.
+
+    Usage:
+        result = run_early_spsa_full(vla, image, instruction, cfg)
+        save_early_result(result, "L_star_early_libero.pt")
+    """
+    import os
+    payload = {
+        "injection_type": "early",
+        "L_star": result["L_star"].detach().cpu(),
+        "final_J": result["final_J"],
+        "baseline_J": result["baseline_J"],
+        "best_params": result["best_params"],
+        "gate_probe": result["gate_probe"],
+        "gate_disabled": result["gate_disabled"],
+        "final_actions": result["final_actions"],
+        "final_norm_actions": result["final_norm_actions"],
+        "baseline_norm_actions": result["baseline_norm_actions"],
+        "history": result["phase_b"]["history"],
+        "final_info": result["phase_b"]["final_info"],
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(payload, path)
+    norm = float(payload["L_star"].norm())
+    print(f"  Saved early L* checkpoint -> {path}")
+    print(f"    |L*|={norm:.2f}  J={result['final_J']:.4f}  "
+          f"(baseline={result['baseline_J']:.4f})  "
+          f"gate={result['gate_probe']}")
+
+
+def load_early_result(path: str, device: str = "cuda") -> dict:
+    """Load a saved early L* checkpoint.
+
+    Usage:
+        ckpt = load_early_result("L_star_early_libero.pt")
+        set_early_z_latent(vla, ckpt["L_star"])
+    """
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    ckpt["L_star"] = ckpt["L_star"].to(device)
+    norm = float(ckpt["L_star"].norm())
+    print(f"  Loaded early L* checkpoint <- {path}")
+    print(f"    |L*|={norm:.2f}  J={ckpt['final_J']:.4f}  "
+          f"(baseline={ckpt['baseline_J']:.4f})  "
+          f"gate={ckpt.get('gate_probe', 'unknown')}")
+    return ckpt
+
+
+# ===================================================================
 # A/B comparison helper
 # ===================================================================
 def compare_early_vs_late(early_result: dict, late_result: dict) -> dict:

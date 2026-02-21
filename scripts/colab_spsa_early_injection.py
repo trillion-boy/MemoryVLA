@@ -118,8 +118,40 @@ class EarlySPSAConfig(ZSPSAConfig):
 
 
 # ===================================================================
+# DDP/wrapper-safe model unwrapping
+# ===================================================================
+def _unwrap_model(vla_model):
+    """Unwrap DDP/FSDP/DataParallel wrapper to get the raw MemoryVLA.
+
+    Handles:
+      - torch.nn.parallel.DistributedDataParallel  (.module)
+      - torch.nn.parallel.DataParallel              (.module)
+      - torch.distributed.fsdp.FullyShardedDataParallel (.module)
+      - No wrapper (returns as-is)
+    """
+    model = vla_model
+    # Peel off wrapper layers (handles nested wrappers too)
+    while hasattr(model, "module"):
+        model = model.module
+    return model
+
+
+# ===================================================================
 # Projector hook helpers
 # ===================================================================
+def _validate_L_z_shape(L_z: torch.Tensor, cog_dim: int):
+    """Validate L_z shape is [1, 1, cog_dim] for token-shared injection.
+
+    Raises ValueError with clear diagnostic if shape is wrong.
+    """
+    expected = (1, 1, cog_dim)
+    if L_z.shape != expected:
+        raise ValueError(
+            f"L_z shape mismatch: got {tuple(L_z.shape)}, expected {expected}. "
+            f"Phase 1 uses token-shared injection — L_z must be [1, 1, {cog_dim}]."
+        )
+
+
 def _make_projector_hook(L_z: torch.Tensor):
     """Create a forward_hook function that adds L_z to projector output.
 
@@ -137,11 +169,11 @@ def _make_projector_hook(L_z: torch.Tensor):
 
 
 def _get_projector(vla_model):
-    """Get the projector module from a MemoryVLA model.
+    """Get the projector module from a MemoryVLA model (wrapper-safe).
 
-    Access path: vla_model.vlm.projector
+    Unwraps DDP/FSDP before accessing vlm.projector.
     """
-    return vla_model.vlm.projector
+    return _unwrap_model(vla_model).vlm.projector
 
 
 # ===================================================================
@@ -176,7 +208,11 @@ def _eval_early_objective(
         J: scalar (higher = better)
         info: dict with conf_llm, conf_action, actions, raw_actions, etc.
     """
-    _ensure_ddim(vla_model, cfg.num_ddim_steps)
+    # Unwrap once — all internal access uses raw_model to avoid DDP mismatch
+    raw_model = _unwrap_model(vla_model)
+
+    _ensure_ddim(raw_model, cfg.num_ddim_steps)
+    _validate_L_z_shape(L_z, cfg.cog_dim)
 
     # ── Save and fix all RNG sources for paired SPSA evaluation ──
     _rng_states_saved = None
@@ -196,13 +232,15 @@ def _eval_early_objective(
         random.seed(noise_seed)
 
     # ── Guard: temporarily remove any persistent early hook ──
-    had_persistent_hook = hasattr(vla_model, "_early_z_hook_handle")
+    # Check on raw_model (where set_early_z_latent stores state) to avoid
+    # DDP wrapper mismatch where eval checks wrapper but state lives on inner model.
+    had_persistent_hook = hasattr(raw_model, "_early_z_hook_handle")
     persistent_handle = None
     if had_persistent_hook:
         if cfg.verbose:
             print("  [warn] persistent early L_z hook detected — "
                   "temporarily removed for isolated eval")
-        persistent_handle = vla_model._early_z_hook_handle
+        persistent_handle = raw_model._early_z_hook_handle
         persistent_handle.remove()
 
     # ── Register projector hook for this evaluation ──
@@ -284,15 +322,14 @@ def _eval_early_objective(
     finally:
         # Remove eval hook
         handle.remove()
-        # Restore persistent hook if it was active
+        # Restore persistent hook if it was active (on raw_model, not wrapper)
         if had_persistent_hook and persistent_handle is not None:
-            projector = _get_projector(vla_model)
-            # Re-register the persistent hook's L_z
-            L_persistent = vla_model._early_z_latent
+            projector = _get_projector(raw_model)
+            L_persistent = raw_model._early_z_latent
             new_handle = projector.register_forward_hook(
                 _make_projector_hook(L_persistent)
             )
-            vla_model._early_z_hook_handle = new_handle
+            raw_model._early_z_hook_handle = new_handle
         # Restore RNG states
         if _rng_states_saved is not None:
             torch.random.set_rng_state(_rng_states_saved["torch_cpu"])
@@ -824,12 +861,20 @@ def run_early_spsa_full(
 # ===================================================================
 # Utility: persistent early injection for deployment
 # ===================================================================
-def set_early_z_latent(vla_model, L_z: torch.Tensor):
+def set_early_z_latent(vla_model, L_z: torch.Tensor, cog_dim: int = 4096):
     """
     Permanently hook projector to add L_z for all future predict_action calls.
 
     Uses register_forward_hook (cleaner than monkey-patching).
     Call clear_early_z_latent() to remove.
+
+    Wrapper-safe: unwraps DDP/FSDP before accessing projector and storing
+    state, so _eval_early_objective's guard always finds the hook.
+
+    Args:
+        vla_model: MemoryVLA (possibly DDP-wrapped).
+        L_z: [1, 1, cog_dim] latent. None to just clear.
+        cog_dim: Expected last dimension (default 4096). Used for validation.
 
     Usage after optimization:
         set_early_z_latent(vla, result["L_star"])
@@ -841,22 +886,26 @@ def set_early_z_latent(vla_model, L_z: torch.Tensor):
     if L_z is None:
         return
 
+    _validate_L_z_shape(L_z, cog_dim)
+
+    raw_model = _unwrap_model(vla_model)
     _L = L_z.detach().clone()
-    projector = _get_projector(vla_model)
+    projector = _get_projector(raw_model)
     handle = projector.register_forward_hook(_make_projector_hook(_L))
 
-    # Store references for cleanup and eval-guard
-    vla_model._early_z_hook_handle = handle
-    vla_model._early_z_latent = _L
+    # Store on raw (unwrapped) model — _eval_early_objective checks raw_model
+    raw_model._early_z_hook_handle = handle
+    raw_model._early_z_latent = _L
 
 
 def clear_early_z_latent(vla_model):
-    """Remove persistent early injection hook."""
-    if hasattr(vla_model, "_early_z_hook_handle"):
-        vla_model._early_z_hook_handle.remove()
-        del vla_model._early_z_hook_handle
-    if hasattr(vla_model, "_early_z_latent"):
-        del vla_model._early_z_latent
+    """Remove persistent early injection hook (wrapper-safe)."""
+    raw_model = _unwrap_model(vla_model)
+    if hasattr(raw_model, "_early_z_hook_handle"):
+        raw_model._early_z_hook_handle.remove()
+        del raw_model._early_z_hook_handle
+    if hasattr(raw_model, "_early_z_latent"):
+        del raw_model._early_z_latent
 
 
 # ===================================================================

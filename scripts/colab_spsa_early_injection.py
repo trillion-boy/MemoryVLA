@@ -46,8 +46,10 @@ Usage (Colab):
 """
 from __future__ import annotations
 
+import contextlib
 import copy
 from dataclasses import dataclass
+import io
 import random
 from typing import Dict, List, Optional, Tuple
 
@@ -250,10 +252,12 @@ def _eval_early_objective(
 
     try:
         # ── Capture trajectory + LLM confidence in single pass ──
+        # Suppress "** reset memory **" spam from predict_action (prints once
+        # per call × hundreds of calls during calibration = unreadable output).
         with _capture_pred_xstarts(
             vla_model, use_ddim=cfg.use_ddim,
             num_ddim_steps=cfg.num_ddim_steps,
-        ) as captured:
+        ) as captured, contextlib.redirect_stdout(io.StringIO()):
             actions, norm_actions, llm_conf = vla_model.predict_action(
                 image=image,
                 instruction=instruction,

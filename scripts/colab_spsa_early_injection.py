@@ -84,14 +84,26 @@ class EarlySPSAConfig(ZSPSAConfig):
     """
 
     # -- override: w_lang can now be meaningful --
-    w_lang: float = 0.0
+    w_lang: float = 0.3
     """Weight for LLM confidence in composite J.
-    Default 0.0 for Phase 1 (position-effect-only test).
-    Unlike late injection, conf_llm MAY respond to L_z here.
-    Phase 2: if auto-gate probe confirms responsiveness, increase to ~0.3."""
+    With cog_divergence, conf_llm is responsive to L_z, so we can
+    use it as a real optimization signal from the start."""
 
-    w_act: float = 1.0
-    """Weight for action confidence. Kept at 1.0 for Phase 1 parity."""
+    w_act: float = 0.7
+    """Weight for action confidence. Reduced to make room for w_lang."""
+
+    # -- override: confidence type --
+    confidence_type: str = "cog_divergence"
+    """Use cosine distance between conditioned cog_tokens and
+    unconditional embedding. This is RESPONSIVE to L_z perturbation
+    (unlike 'max_prob' which measures a meaningless dummy token).
+    Range: [0, 1] where 1 = maximum instruction conditioning."""
+
+    # -- override: gate floor for new confidence range --
+    llm_gate_floor: float = 0.15
+    """Adjusted for cog_divergence range [0,1].
+    Typical cog_divergence values are 0.3-0.7, so floor=0.15
+    rarely clips the gate."""
 
     # -- override: tighter norm for pre-LLM injection --
     max_L_norm: float = 30.0
@@ -508,8 +520,9 @@ def optimize_early_spsa(
                     info_p["conf_llm"], info_p["conf_action"])
                 nlm_m, nac_m = normalizer.normalize(
                     info_m["conf_llm"], info_m["conf_action"])
-                J_p = info_p["gate"] * (cfg.w_lang * nlm_p + cfg.w_act * nac_p)
-                J_m = info_m["gate"] * (cfg.w_lang * nlm_m + cfg.w_act * nac_m)
+                # Gate only dampens the lang term (consistent with non-normalized J)
+                J_p = (info_p["gate"] * cfg.w_lang * nlm_p) + (cfg.w_act * nac_p)
+                J_m = (info_m["gate"] * cfg.w_lang * nlm_m) + (cfg.w_act * nac_m)
 
         # SPSA gradient estimate (ascent → maximize J)
         ghat = ((J_p - J_m) / (2.0 * ck)) * delta
@@ -772,8 +785,8 @@ def run_phase_b_early(
         nlm_f, nac_f = opt_normalizer.normalize(
             info_final["conf_llm"], info_final["conf_action"]
         )
-        J_final_norm = info_final["gate"] * (
-            run_cfg.w_lang * nlm_f + run_cfg.w_act * nac_f
+        J_final_norm = (info_final["gate"] * run_cfg.w_lang * nlm_f) + (
+            run_cfg.w_act * nac_f
         )
         j_divergence = abs(J_end_inloop - J_final_norm)
         if j_divergence > 0.1 * max(abs(J_end_inloop), abs(J_final_norm), 1e-6):
@@ -844,11 +857,14 @@ def run_early_spsa_full(
     print(f"  |L_z|        : {float(phase_b['L_star'].norm()):.2f}")
 
     # Phase 2 guidance
+    print(f"  conf_type   : {cfg.confidence_type}")
+    print(f"  w_lang/w_act: {cfg.w_lang}/{cfg.w_act}")
     if not gate_off:
         print()
         print("  >>> conf_llm is RESPONSIVE to early L_z!")
-        print("  >>> Phase 2: re-run with w_lang=0.3 to exploit LLM signal.")
-        print("  >>>   cfg = EarlySPSAConfig(w_lang=0.3, w_act=0.7, ...)")
+        if cfg.confidence_type == "cog_divergence":
+            print("  >>> Using cog_divergence: cosine distance(cog_tokens, uncondition).")
+            print("  >>> This directly measures instruction conditioning strength.")
     else:
         print()
         print("  >>> conf_llm is invariant — same as late injection.")

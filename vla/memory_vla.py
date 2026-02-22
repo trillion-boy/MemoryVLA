@@ -959,19 +959,46 @@ class MemoryVLA(nn.Module):
         if not return_confidence:
             return actions, normalized_actions
 
-        # Compute confidence from LLM token logits
-        if not hasattr(output, 'scores') or len(output.scores) == 0:
-            confidence = np.array([0.0], dtype=np.float32)
+        # Compute confidence from LLM representation
+        if confidence_type == 'cog_divergence':
+            # ── NEW: cosine distance between conditioned cog_tokens
+            #    and the unconditional embedding.
+            #    High divergence = LLM strongly encodes the instruction.
+            #    This metric is RESPONSIVE to L_z perturbation (unlike
+            #    the old max_prob of a single dummy token).
+            uncond = self.action_model.net.z_embedder.uncondition  # [k, D]
+            if uncond.ndim == 1:
+                uncond = uncond.unsqueeze(0)  # [1, D]
+            # cog_tokens: [B, 1, D] — squeeze to [B, D] for comparison
+            cond_flat = cog_tokens.squeeze(1).float()         # [B, D]
+            uncond_flat = uncond.expand_as(cond_flat).float()  # [B, D]
+            cos_sim = torch.nn.functional.cosine_similarity(
+                cond_flat, uncond_flat, dim=-1
+            )  # [B] in [-1, 1]
+            # conf = 1 - cos_sim: ranges 0 (identical) to 2 (opposite)
+            # Normalize to [0, 1] via (1 - cos_sim) / 2
+            confidence = ((1.0 - cos_sim) / 2.0).detach().cpu().numpy().astype(np.float32)
+        elif confidence_type == 'cog_norm':
+            # ── NEW: L2 norm of cog_tokens as confidence proxy.
+            #    Larger activation = stronger conditioning signal.
+            cond_flat = cog_tokens.squeeze(1).float()  # [B, D]
+            norm = cond_flat.norm(dim=-1)  # [B]
+            # Normalize by sqrt(dim) so typical values are around 1.0
+            confidence = (norm / (cond_flat.shape[-1] ** 0.5)).detach().cpu().numpy().astype(np.float32)
         else:
-            token_logits = output.scores[-1]  # [B, vocab]
-            token_probs = torch.softmax(token_logits.float(), dim=-1)
-            if confidence_type == 'max_logit':
-                confidence = token_logits.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
-            elif confidence_type == 'token_prob':
-                gen_ids = output.sequences[:, -1]
-                confidence = token_probs.gather(1, gen_ids.unsqueeze(-1)).squeeze(-1).detach().cpu().numpy().astype(np.float32)
-            else:  # 'max_prob'
-                confidence = token_probs.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+            # Legacy token-probability-based confidence
+            if not hasattr(output, 'scores') or len(output.scores) == 0:
+                confidence = np.array([0.0], dtype=np.float32)
+            else:
+                token_logits = output.scores[-1]  # [B, vocab]
+                token_probs = torch.softmax(token_logits.float(), dim=-1)
+                if confidence_type == 'max_logit':
+                    confidence = token_logits.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
+                elif confidence_type == 'token_prob':
+                    gen_ids = output.sequences[:, -1]
+                    confidence = token_probs.gather(1, gen_ids.unsqueeze(-1)).squeeze(-1).detach().cpu().numpy().astype(np.float32)
+                else:  # 'max_prob'
+                    confidence = token_probs.max(dim=-1).values.detach().cpu().numpy().astype(np.float32)
 
         return actions, normalized_actions, confidence
 

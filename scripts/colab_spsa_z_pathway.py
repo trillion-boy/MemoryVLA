@@ -588,9 +588,9 @@ def optimize_z_spsa(
             if normalizer.ready:
                 nlm_p, nac_p = normalizer.normalize(info_p["conf_llm"], info_p["conf_action"])
                 nlm_m, nac_m = normalizer.normalize(info_m["conf_llm"], info_m["conf_action"])
-                # Re-apply gate so "baseless confidence" penalty survives normalization
-                J_p = info_p["gate"] * (cfg.w_lang * nlm_p + cfg.w_act * nac_p)
-                J_m = info_m["gate"] * (cfg.w_lang * nlm_m + cfg.w_act * nac_m)
+                # Gate only dampens the lang term; action term is never gated.
+                J_p = (info_p["gate"] * cfg.w_lang * nlm_p) + (cfg.w_act * nac_p)
+                J_m = (info_m["gate"] * cfg.w_lang * nlm_m) + (cfg.w_act * nac_m)
 
         # SPSA gradient estimate (ascent → maximize J)
         ghat = ((J_p - J_m) / (2.0 * ck)) * delta
